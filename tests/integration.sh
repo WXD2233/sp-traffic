@@ -62,17 +62,35 @@ SP_DATA_DIR="$TEST_DIR/data" \
 WORKER_PID=$!
 
 sleep 7
+[ -s "$TEST_DIR/data/live_stats" ] || {
+  echo "expected live_stats to be created" >&2
+  exit 1
+}
+[ "$(awk '{print NF}' "$TEST_DIR/data/live_stats")" -eq 5 ] || {
+  echo "expected live_stats to contain five fields" >&2
+  exit 1
+}
 kill "$WORKER_PID" 2>/dev/null || true
 wait "$WORKER_PID" 2>/dev/null || true
 WORKER_PID=""
 
-total="$(awk '{sum += $1} END {print sum + 0}' "$TEST_DIR"/data/counters/worker-*)"
+total="$(awk '{sum += $1} END {print sum + 0}' "$TEST_DIR"/data/counters/download-total-worker-*)"
 [ "$total" -ge 262144 ] || {
   echo "expected at least one completed 256 KiB download, got $total bytes" >&2
   exit 1
 }
+session_total="$(awk '{sum += $1} END {print sum + 0}' "$TEST_DIR"/data/counters/download-session-worker-*)"
+[ "$session_total" -ge 262144 ] || {
+  echo "expected session download statistics, got $session_total bytes" >&2
+  exit 1
+}
+upload_total="$(awk '{sum += $1} END {print sum + 0}' "$TEST_DIR"/data/counters/upload-total-worker-*)"
+[ "$upload_total" -ge 0 ] || {
+  echo "expected upload statistics to be numeric" >&2
+  exit 1
+}
 
-rm -f "$TEST_DIR"/data/counters/worker-* "$TEST_DIR/data/paused" "$TEST_DIR/data/pause_reason"
+rm -f "$TEST_DIR/data/paused" "$TEST_DIR/data/pause_reason"
 printf 'MIN_FREE_DISK_MB=999999999\n' >>"$TEST_DIR/config/config"
 
 SP_CONFIG_FILE="$TEST_DIR/config/config" \
@@ -87,8 +105,48 @@ sleep 2
   exit 1
 }
 grep -q '^disk_low:' "$TEST_DIR/data/pause_reason"
+session_after_restart="$(awk '{sum += $1} END {print sum + 0}' \
+  "$TEST_DIR"/data/counters/download-session-worker-*)"
+[ "$session_after_restart" -eq 0 ] || {
+  echo "expected a restarted worker to reset session statistics" >&2
+  exit 1
+}
+historical_after_restart="$(awk '{sum += $1} END {print sum + 0}' \
+  "$TEST_DIR"/data/counters/download-total-worker-*)"
+[ "$historical_after_restart" -eq "$total" ] || {
+  echo "expected historical total to survive restart" >&2
+  exit 1
+}
 kill "$WORKER_PID" 2>/dev/null || true
 wait "$WORKER_PID" 2>/dev/null || true
 WORKER_PID=""
 
-printf 'Worker integration passed (%s bytes); low-disk guard passed.\n' "$total"
+printf 'systemd\n' >"$TEST_DIR/config/backend"
+id() {
+  if [ "${1:-}" = "-u" ]; then
+    printf '0\n'
+  else
+    command id "$@"
+  fi
+}
+systemctl() {
+  case "${1:-}" in
+    is-active) return 3 ;;
+    *) return 0 ;;
+  esac
+}
+sysctl() {
+  printf 'mock\n'
+}
+tput() {
+  printf '130\n'
+}
+export -f id systemctl sysctl tput
+SP_CONFIG_DIR="$TEST_DIR/config" \
+SP_DATA_DIR="$TEST_DIR/data" \
+  "$ROOT_DIR/sp" dashboard >"$TEST_DIR/dashboard.txt"
+grep -q '开始/继续' "$TEST_DIR/dashboard.txt"
+grep -q '本次运行' "$TEST_DIR/dashboard.txt"
+grep -q '历史总计' "$TEST_DIR/dashboard.txt"
+
+printf 'Worker integration passed (%s bytes); session/history and low-disk guard passed.\n' "$total"

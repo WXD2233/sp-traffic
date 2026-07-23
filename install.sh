@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SP_VERSION="1.3.0"
+readonly SP_VERSION="1.4.0"
 readonly SP_REPOSITORY="${SP_REPOSITORY:-WXD2233/sp-traffic}"
 readonly SP_BRANCH="${SP_BRANCH:-main}"
 readonly SP_RAW_BASE="${SP_RAW_BASE:-https://raw.githubusercontent.com/${SP_REPOSITORY}/${SP_BRANCH}}"

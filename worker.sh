@@ -9,6 +9,9 @@ readonly PID_DIR="${DATA_DIR}/pids"
 readonly PAUSE_FILE="${DATA_DIR}/paused"
 readonly PAUSE_REASON_FILE="${DATA_DIR}/pause_reason"
 readonly EFFECTIVE_WORKERS_FILE="${DATA_DIR}/effective_workers"
+readonly LIVE_STATS_FILE="${DATA_DIR}/live_stats"
+readonly RATE_HISTORY_FILE="${DATA_DIR}/rate_history"
+readonly SESSION_STARTED_FILE="${DATA_DIR}/session_started"
 readonly HARD_MAX_WORKERS=32
 
 WORKERS=0
@@ -160,15 +163,112 @@ read_counter() {
   printf '%s\n' "$value"
 }
 
-record_bytes() {
-  local slot="$1" bytes="$2" file current
+add_counter() {
+  local file="$1" bytes="$2" current
   bytes="${bytes%%.*}"
   bytes="${bytes%$'\r'}"
   valid_uint "$bytes" || return 0
-  file="${COUNTER_DIR}/worker-${slot}"
   current="$(read_counter "$file")"
   printf '%s\n' "$((current + bytes))" >"${file}.tmp"
   mv -f "${file}.tmp" "$file"
+}
+
+record_transfer() {
+  local slot="$1" download_bytes="$2" upload_bytes="$3"
+  add_counter "${COUNTER_DIR}/download-total-worker-${slot}" "$download_bytes"
+  add_counter "${COUNTER_DIR}/download-session-worker-${slot}" "$download_bytes"
+  add_counter "${COUNTER_DIR}/upload-total-worker-${slot}" "$upload_bytes"
+  add_counter "${COUNTER_DIR}/upload-session-worker-${slot}" "$upload_bytes"
+}
+
+reset_session_stats() {
+  local file now
+  for file in \
+    "${COUNTER_DIR}"/download-session-worker-* \
+    "${COUNTER_DIR}"/upload-session-worker-*; do
+    [ -f "$file" ] || continue
+    printf '0\n' > "$file"
+  done
+  now="$(date +%s)"
+  printf '%s\n' "$now" >"${SESSION_STARTED_FILE}.tmp"
+  mv -f "${SESSION_STARTED_FILE}.tmp" "$SESSION_STARTED_FILE"
+  : > "$RATE_HISTORY_FILE"
+  printf '0 0 0 0 %s\n' "$now" >"${LIVE_STATS_FILE}.tmp"
+  mv -f "${LIVE_STATS_FILE}.tmp" "$LIVE_STATS_FILE"
+}
+
+update_live_stats() {
+  local file rates now download_rate upload_rate active_download active_upload
+  local -a progress_files=()
+
+  for file in "${DATA_DIR}"/progress-*.tmp; do
+    [ -f "$file" ] || continue
+    progress_files+=("$file")
+  done
+
+  if [ "${#progress_files[@]}" -gt 0 ]; then
+    rates="$(awk -v RS='\r' '
+      function bytes(value, suffix, multiplier) {
+        gsub(/,/, "", value)
+        suffix=substr(value, length(value), 1)
+        multiplier=1
+        if (suffix=="k" || suffix=="K") {
+          multiplier=1024
+          value=substr(value, 1, length(value)-1)
+        } else if (suffix=="m" || suffix=="M") {
+          multiplier=1048576
+          value=substr(value, 1, length(value)-1)
+        } else if (suffix=="g" || suffix=="G") {
+          multiplier=1073741824
+          value=substr(value, 1, length(value)-1)
+        } else if (suffix=="t" || suffix=="T") {
+          multiplier=1099511627776
+          value=substr(value, 1, length(value)-1)
+        }
+        return int((value + 0) * multiplier)
+      }
+      {
+        line=$0
+        gsub(/\n/, " ", line)
+        sub(/^[[:space:]]+/, "", line)
+        fields=split(line, part, /[[:space:]]+/)
+        if (fields >= 12 && part[1] ~ /^[0-9]+$/ && part[3] ~ /^[0-9]+$/) {
+          down_rate[FILENAME]=bytes(part[12])
+          up_rate[FILENAME]=bytes(part[8])
+          down_active[FILENAME]=bytes(part[4])
+          up_active[FILENAME]=bytes(part[6])
+        }
+      }
+      END {
+        for (name in down_rate) total_down_rate += down_rate[name]
+        for (name in up_rate) total_up_rate += up_rate[name]
+        for (name in down_active) total_down_active += down_active[name]
+        for (name in up_active) total_up_active += up_active[name]
+        printf "%.0f %.0f %.0f %.0f\n",
+          total_down_rate, total_up_rate, total_down_active, total_up_active
+      }
+    ' "${progress_files[@]}" 2>/dev/null || printf '0 0 0 0\n')"
+  else
+    rates="0 0 0 0"
+  fi
+
+  read -r download_rate upload_rate active_download active_upload <<<"$rates"
+  valid_uint "$download_rate" || download_rate=0
+  valid_uint "$upload_rate" || upload_rate=0
+  valid_uint "$active_download" || active_download=0
+  valid_uint "$active_upload" || active_upload=0
+  now="$(date +%s)"
+
+  printf '%s %s %s %s %s\n' \
+    "$download_rate" "$upload_rate" "$active_download" "$active_upload" "$now" \
+    >"${LIVE_STATS_FILE}.tmp"
+  mv -f "${LIVE_STATS_FILE}.tmp" "$LIVE_STATS_FILE"
+  printf '%s %s %s\n' "$download_rate" "$upload_rate" "$now" >> "$RATE_HISTORY_FILE"
+
+  if [ $((now % 60)) -eq 0 ]; then
+    tail -n 60 "$RATE_HISTORY_FILE" >"${RATE_HISTORY_FILE}.tmp"
+    mv -f "${RATE_HISTORY_FILE}.tmp" "$RATE_HISTORY_FILE"
+  fi
 }
 
 wait_while_paused() {
@@ -180,9 +280,10 @@ wait_while_paused() {
 download_once() {
   local slot="$1" url="$2"
   local size_file="${DATA_DIR}/size-${slot}.tmp"
+  local progress_file="${DATA_DIR}/progress-${slot}.tmp"
   local pid_file="${PID_DIR}/curl-${slot}.pid" per_worker_kbps=0
   local -a rate_arg=() retry_args=()
-  local active_workers=1 curl_pid status bytes
+  local active_workers=1 curl_pid status download_bytes=0 upload_bytes=0
 
   if [ "$MAX_MBPS" -gt 0 ]; then
     if [ -f "$EFFECTIVE_WORKERS_FILE" ]; then
@@ -201,14 +302,16 @@ download_once() {
   fi
 
   : > "$size_file"
-  curl --fail --location --silent --show-error \
+  : > "$progress_file"
+  curl --fail --location --show-error \
     --output /dev/null \
-    --write-out '%{size_download}\n' \
+    --write-out '%{size_download} %{size_upload}\n' \
+    --stderr "$progress_file" \
     --connect-timeout "$CONNECT_TIMEOUT" \
     --max-time "$TRANSFER_TIMEOUT" \
     --speed-time 30 --speed-limit 1024 \
     "${retry_args[@]}" \
-    --user-agent "sp-traffic/1.3 authorized-bandwidth-test" \
+    --user-agent "sp-traffic/1.4 authorized-bandwidth-test" \
     "${rate_arg[@]}" \
     "$url" >"$size_file" &
   curl_pid=$!
@@ -217,11 +320,13 @@ download_once() {
   status=$?
   rm -f "$pid_file"
 
-  if [ "$status" -eq 0 ]; then
-    read -r bytes < "$size_file" || bytes=0
-    record_bytes "$slot" "$bytes"
-  fi
-  rm -f "$size_file"
+  read -r download_bytes upload_bytes < "$size_file" || true
+  download_bytes="${download_bytes%%.*}"
+  upload_bytes="${upload_bytes%%.*}"
+  valid_uint "$download_bytes" || download_bytes=0
+  valid_uint "$upload_bytes" || upload_bytes=0
+  record_transfer "$slot" "$download_bytes" "$upload_bytes"
+  rm -f "$size_file" "$progress_file"
   return "$status"
 }
 
@@ -265,11 +370,18 @@ stop_slot() {
 }
 
 cleanup() {
-  local slot
+  local slot now
   for ((slot=1; slot<=HARD_MAX_WORKERS; slot++)); do
     stop_slot "$slot"
   done
-  rm -f "$EFFECTIVE_WORKERS_FILE" "${DATA_DIR}"/size-*.tmp "${PID_DIR}"/curl-*.pid
+  now="$(date +%s)"
+  printf '0 0 0 0 %s\n' "$now" >"${LIVE_STATS_FILE}.tmp"
+  mv -f "${LIVE_STATS_FILE}.tmp" "$LIVE_STATS_FILE"
+  rm -f \
+    "$EFFECTIVE_WORKERS_FILE" \
+    "${DATA_DIR}"/size-*.tmp \
+    "${DATA_DIR}"/progress-*.tmp \
+    "${PID_DIR}"/curl-*.pid
 }
 
 supervise() {
@@ -295,6 +407,7 @@ supervise() {
       fi
     done
     for ((tick=0; tick<30; tick++)); do
+      update_live_stats
       sleep 1
     done
   done
@@ -315,6 +428,7 @@ main() {
   }
 
   mkdir -p "$COUNTER_DIR" "$PID_DIR"
+  reset_session_stats
   load_config
   load_endpoints
   [ "${#ENDPOINTS[@]}" -gt 0 ] || {

@@ -9,6 +9,9 @@ readonly ENDPOINTS_FILE="${CONFIG_DIR}/endpoints"
 readonly BACKEND_FILE="${CONFIG_DIR}/backend"
 readonly PAUSE_FILE="${DATA_DIR}/paused"
 readonly PAUSE_REASON_FILE="${DATA_DIR}/pause_reason"
+readonly LIVE_STATS_FILE="${DATA_DIR}/live_stats"
+readonly RATE_HISTORY_FILE="${DATA_DIR}/rate_history"
+readonly SESSION_STARTED_FILE="${DATA_DIR}/session_started"
 readonly HARD_MAX_WORKERS=32
 readonly DEFAULT_ENDPOINT="${SP_DEFAULT_ENDPOINT:-https://sin-speed.hetzner.com/10GB.bin}"
 
@@ -124,37 +127,123 @@ human_bytes() {
   }'
 }
 
-total_downloaded() {
+sum_counter_prefix() {
+  local prefix="$1"
   local total=0 file value
-  for file in "${DATA_DIR}"/counters/worker-*; do
+  for file in "${DATA_DIR}/counters/${prefix}"*; do
     [ -f "$file" ] || continue
     read -r value < "$file" || value=0
+    value="${value%$'\r'}"
     valid_uint "$value" || value=0
     total=$((total + value))
   done
   printf '%s\n' "$total"
 }
 
-show_status() {
-  local state workers=0 qdisc cc total pause_reason="" available_mb minimum_mb aggressive_mode
+total_downloaded() {
+  local legacy current
+  legacy="$(sum_counter_prefix 'worker-')"
+  current="$(sum_counter_prefix 'download-total-worker-')"
+  printf '%s\n' "$((legacy + current))"
+}
+
+session_downloaded() {
+  sum_counter_prefix 'download-session-worker-'
+}
+
+total_uploaded() {
+  sum_counter_prefix 'upload-total-worker-'
+}
+
+session_uploaded() {
+  sum_counter_prefix 'upload-session-worker-'
+}
+
+read_live_stats() {
+  local download_rate=0 upload_rate=0 active_download=0 active_upload=0 timestamp=0 now
+  if [ -r "$LIVE_STATS_FILE" ]; then
+    read -r download_rate upload_rate active_download active_upload timestamp < "$LIVE_STATS_FILE" || true
+  fi
+  valid_uint "$download_rate" || download_rate=0
+  valid_uint "$upload_rate" || upload_rate=0
+  valid_uint "$active_download" || active_download=0
+  valid_uint "$active_upload" || active_upload=0
+  valid_uint "$timestamp" || timestamp=0
+  now="$(date +%s)"
+  if [ "$timestamp" -eq 0 ] || [ $((now - timestamp)) -gt 5 ]; then
+    download_rate=0
+    upload_rate=0
+    active_download=0
+    active_upload=0
+  fi
+  printf '%s %s %s %s %s\n' \
+    "$download_rate" "$upload_rate" "$active_download" "$active_upload" "$timestamp"
+}
+
+session_duration() {
+  local started=0 now
+  if [ -r "$SESSION_STARTED_FILE" ]; then
+    read -r started < "$SESSION_STARTED_FILE" || started=0
+  fi
+  valid_uint "$started" || started=0
+  now="$(date +%s)"
+  if [ "$started" -eq 0 ] || [ "$now" -lt "$started" ]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$((now - started))"
+  fi
+}
+
+format_duration() {
+  local seconds="$1"
+  valid_uint "$seconds" || seconds=0
+  printf '%02d:%02d:%02d' \
+    "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+}
+
+format_rate() {
+  local bytes_per_second="$1"
+  awk -v value="$bytes_per_second" 'BEGIN {printf "%.1f Mbps", value * 8 / 1000000}'
+}
+
+service_state_text() {
+  local pause_reason=""
   if service_is_active; then
     if [ -f "$PAUSE_FILE" ]; then
       [ -r "$PAUSE_REASON_FILE" ] && read -r pause_reason < "$PAUSE_REASON_FILE"
       case "$pause_reason" in
-        disk_low:*) state="已暂停（低磁盘保护）" ;;
-        manual) state="已手动暂停" ;;
-        *) state="已暂停" ;;
+        disk_low:*) printf '已暂停（低磁盘保护）\n' ;;
+        manual) printf '已手动暂停\n' ;;
+        *) printf '已暂停\n' ;;
       esac
     else
-      state="运行中"
+      printf '运行中\n'
     fi
   else
-    state="已停止"
+    printf '已停止\n'
   fi
+}
+
+show_status() {
+  local state workers=0 qdisc cc available_mb minimum_mb aggressive_mode
+  local download_rate upload_rate active_download active_upload
+  local session_down session_up total_down total_up duration
+  state="$(service_state_text)"
   [ -r "${DATA_DIR}/effective_workers" ] && read -r workers < "${DATA_DIR}/effective_workers"
   qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
-  total="$(total_downloaded)"
+  read -r download_rate upload_rate active_download active_upload _ <<<"$(read_live_stats)"
+  if ! service_is_active; then
+    download_rate=0
+    upload_rate=0
+    active_download=0
+    active_upload=0
+  fi
+  session_down=$(( $(session_downloaded) + active_download ))
+  session_up=$(( $(session_uploaded) + active_upload ))
+  total_down=$(( $(total_downloaded) + active_download ))
+  total_up=$(( $(total_uploaded) + active_upload ))
+  duration="$(session_duration)"
   available_mb="$(available_disk_mb 2>/dev/null || printf '未知')"
   minimum_mb="$(config_uint MIN_FREE_DISK_MB 200)"
   aggressive_mode="$(config_uint AGGRESSIVE_MODE 1)"
@@ -168,7 +257,13 @@ SP Traffic 状态
   服务:       ${state}
   有效并发:   ${workers}
   授权端点:   $(endpoint_count)
-  已完成下载: $(human_bytes "$total")
+  实时下载:   $(format_rate "$download_rate")
+  实时上传:   $(format_rate "$upload_rate")
+  本次下载:   $(human_bytes "$session_down")
+  本次上传:   $(human_bytes "$session_up")
+  总计下载:   $(human_bytes "$total_down")
+  总计上传:   $(human_bytes "$total_up")
+  运行时长:   $(format_duration "$duration")
   可用磁盘:   ${available_mb} MiB
   暂停阈值:   ${minimum_mb} MiB
   下载模式:   ${aggressive_mode}
@@ -181,13 +276,22 @@ ensure_endpoint() {
   [ "$(endpoint_count)" -gt 0 ] || die "请先用 '端点管理' 添加你拥有或获授权的下载 URL"
 }
 
-start_command() {
+start_or_resume_command() {
   require_root "$@"
   ensure_endpoint
   ensure_disk_headroom
-  rm -f "$PAUSE_FILE" "$PAUSE_REASON_FILE"
-  service_start
-  ok "服务已启动；关闭 SSH 后仍会在后台运行"
+  if service_is_active; then
+    if [ -f "$PAUSE_FILE" ]; then
+      rm -f "$PAUSE_FILE" "$PAUSE_REASON_FILE"
+      ok "服务已继续"
+    else
+      ok "服务已经在运行"
+    fi
+  else
+    rm -f "$PAUSE_FILE" "$PAUSE_REASON_FILE"
+    service_start
+    ok "服务已启动；本次统计已重新开始，关闭 SSH 后仍会在后台运行"
+  fi
 }
 
 pause_command() {
@@ -205,16 +309,7 @@ pause_command() {
 }
 
 resume_command() {
-  require_root "$@"
-  ensure_endpoint
-  ensure_disk_headroom
-  rm -f "$PAUSE_FILE" "$PAUSE_REASON_FILE"
-  if service_is_active; then
-    ok "服务已继续"
-  else
-    service_start
-    ok "服务已重新启动并继续"
-  fi
+  start_or_resume_command "$@"
 }
 
 stop_command() {
@@ -226,14 +321,29 @@ stop_command() {
 
 clear_command() {
   require_root "$@"
-  local file
+  local file now was_active=0 was_paused=0
+  if service_is_active; then
+    was_active=1
+    [ -f "$PAUSE_FILE" ] && was_paused=1
+    service_stop
+  fi
   mkdir -p "${DATA_DIR}/counters"
-  for file in "${DATA_DIR}"/counters/worker-*; do
+  for file in "${DATA_DIR}"/counters/*; do
     [ -f "$file" ] || continue
     printf '0\n' > "$file"
   done
-  rm -f "${DATA_DIR}"/size-*.tmp
-  ok "临时文件和下载统计已清除（下载内容始终直接写入 /dev/null）"
+  now="$(date +%s)"
+  printf '%s\n' "$now" >"$SESSION_STARTED_FILE"
+  : > "$RATE_HISTORY_FILE"
+  rm -f "${DATA_DIR}"/size-*.tmp "${DATA_DIR}"/progress-*.tmp
+  if [ "$was_active" -eq 1 ]; then
+    if [ "$was_paused" -eq 1 ]; then
+      printf 'manual\n' > "$PAUSE_REASON_FILE"
+      touch "$PAUSE_FILE"
+    fi
+    service_start
+  fi
+  ok "临时文件、单次统计和历史上传/下载统计已清除（下载内容始终写入 /dev/null）"
 }
 
 list_endpoints() {
@@ -415,37 +525,289 @@ uninstall_command() {
   ok "SP Traffic 已卸载；项目创建的 BBR 配置已移除"
 }
 
-main_menu() {
+make_bar() {
+  local value="$1" maximum="$2" width="$3" filled empty filled_text empty_text
+  valid_uint "$value" || value=0
+  valid_uint "$maximum" || maximum=1
+  [ "$maximum" -ge 1 ] || maximum=1
+  [ "$value" -le "$maximum" ] || value="$maximum"
+  filled=$((value * width / maximum))
+  empty=$((width - filled))
+  printf -v filled_text '%*s' "$filled" ''
+  printf -v empty_text '%*s' "$empty" ''
+  filled_text="${filled_text// /█}"
+  empty_text="${empty_text// /·}"
+  printf '%s%s' "$filled_text" "$empty_text"
+}
+
+sparkline() {
+  local column="$1" width="$2"
+  tail -n "$width" "$RATE_HISTORY_FILE" 2>/dev/null |
+    awk -v column="$column" -v width="$width" '
+      {
+        values[count++]=$column
+        if ($column > maximum) maximum=$column
+      }
+      END {
+        for (i=count; i<width; i++) printf " "
+        for (i=0; i<count; i++) {
+          if (maximum <= 0) {
+            printf "."
+          } else {
+            level=int(values[i] * 8 / maximum)
+            if (level > 8) level=8
+            printf "%s", substr(".:-=+*#%@", level + 1, 1)
+          }
+        }
+      }
+    '
+}
+
+dashboard_line() {
+  local row="$1" column="$2"
+  shift 2
+  printf '\033[%s;%sH%s' "$row" "$column" "$*"
+}
+
+load_dashboard_stats() {
+  DASHBOARD_STATE="$(service_state_text)"
+  DASHBOARD_WORKERS=0
+  [ -r "${DATA_DIR}/effective_workers" ] &&
+    read -r DASHBOARD_WORKERS < "${DATA_DIR}/effective_workers"
+  valid_uint "$DASHBOARD_WORKERS" || DASHBOARD_WORKERS=0
+
+  read -r \
+    DASHBOARD_DOWNLOAD_RATE \
+    DASHBOARD_UPLOAD_RATE \
+    DASHBOARD_ACTIVE_DOWNLOAD \
+    DASHBOARD_ACTIVE_UPLOAD \
+    _ <<<"$(read_live_stats)"
+  if ! service_is_active; then
+    DASHBOARD_DOWNLOAD_RATE=0
+    DASHBOARD_UPLOAD_RATE=0
+    DASHBOARD_ACTIVE_DOWNLOAD=0
+    DASHBOARD_ACTIVE_UPLOAD=0
+  fi
+
+  DASHBOARD_SESSION_DOWNLOAD=$(( $(session_downloaded) + DASHBOARD_ACTIVE_DOWNLOAD ))
+  DASHBOARD_SESSION_UPLOAD=$(( $(session_uploaded) + DASHBOARD_ACTIVE_UPLOAD ))
+  DASHBOARD_TOTAL_DOWNLOAD=$(( $(total_downloaded) + DASHBOARD_ACTIVE_DOWNLOAD ))
+  DASHBOARD_TOTAL_UPLOAD=$(( $(total_uploaded) + DASHBOARD_ACTIVE_UPLOAD ))
+  DASHBOARD_DURATION="$(session_duration)"
+  DASHBOARD_DISK="$(available_disk_mb 2>/dev/null || printf '未知')"
+  DASHBOARD_MODE="$(config_uint AGGRESSIVE_MODE 1)"
+  if [ "$DASHBOARD_MODE" -eq 1 ]; then
+    DASHBOARD_MODE="激进模式"
+  else
+    DASHBOARD_MODE="均衡模式"
+  fi
+  DASHBOARD_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
+  DASHBOARD_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
+}
+
+render_dashboard_wide() {
+  local right_column=34 maximum_rate configured_mbps bar_down bar_up history_down history_up
+  local line green cyan yellow reset state_color
+  green=$'\033[1;32m'
+  cyan=$'\033[1;36m'
+  yellow=$'\033[1;33m'
+  reset=$'\033[0m'
+
+  configured_mbps="$(config_uint MAX_MBPS 0)"
+  if [ "$configured_mbps" -gt 0 ]; then
+    maximum_rate=$((configured_mbps * 125000))
+  else
+    maximum_rate=125000000
+    [ "$DASHBOARD_DOWNLOAD_RATE" -le "$maximum_rate" ] ||
+      maximum_rate="$DASHBOARD_DOWNLOAD_RATE"
+    [ "$DASHBOARD_UPLOAD_RATE" -le "$maximum_rate" ] ||
+      maximum_rate="$DASHBOARD_UPLOAD_RATE"
+  fi
+  bar_down="$(make_bar "$DASHBOARD_DOWNLOAD_RATE" "$maximum_rate" 22)"
+  bar_up="$(make_bar "$DASHBOARD_UPLOAD_RATE" "$maximum_rate" 22)"
+  history_down="$(sparkline 1 42)"
+  history_up="$(sparkline 2 42)"
+  case "$DASHBOARD_STATE" in
+    运行中) state_color="$green" ;;
+    已停止) state_color="$yellow" ;;
+    *) state_color="$cyan" ;;
+  esac
+
+  printf '\033[2J\033[H'
+  dashboard_line 1 1 'SP Traffic'
+  dashboard_line 2 1 '  1) 状态'
+  dashboard_line 3 1 '  2) 开始/继续'
+  dashboard_line 4 1 '  3) 暂停'
+  dashboard_line 5 1 '  4) 停止'
+  dashboard_line 6 1 '  5) 清除统计/临时文件'
+  dashboard_line 7 1 '  6) 端点管理'
+  dashboard_line 8 1 '  7) 并发与限速'
+  dashboard_line 9 1 '  8) 最近日志'
+  dashboard_line 10 1 '  9) 卸载'
+  dashboard_line 11 1 '  0) 退出'
+
+  dashboard_line 1 "$right_column" '┌─ 实时流量监控 ─────────────────────────────────────────────────────────┐'
+  printf -v line '│ %s↓ 下载%s  %-12s  %s[%s]%s' \
+    "$green" "$reset" "$(format_rate "$DASHBOARD_DOWNLOAD_RATE")" \
+    "$green" "$bar_down" "$reset"
+  dashboard_line 2 "$right_column" "$line"
+  printf -v line '│ %s↑ 上传%s  %-12s  %s[%s]%s' \
+    "$cyan" "$reset" "$(format_rate "$DASHBOARD_UPLOAD_RATE")" \
+    "$cyan" "$bar_up" "$reset"
+  dashboard_line 3 "$right_column" "$line"
+  dashboard_line 4 "$right_column" '├─ 流量统计 ─────────────────────────────────────────────────────────────┤'
+  printf -v line '│ 本次运行   下载 %-11s   上传 %-11s' \
+    "$(human_bytes "$DASHBOARD_SESSION_DOWNLOAD")" \
+    "$(human_bytes "$DASHBOARD_SESSION_UPLOAD")"
+  dashboard_line 5 "$right_column" "$line"
+  printf -v line '│ 历史总计   下载 %-11s   上传 %-11s' \
+    "$(human_bytes "$DASHBOARD_TOTAL_DOWNLOAD")" \
+    "$(human_bytes "$DASHBOARD_TOTAL_UPLOAD")"
+  dashboard_line 6 "$right_column" "$line"
+  printf -v line '│ 运行时长 %-10s   连接数 %s / %s' \
+    "$(format_duration "$DASHBOARD_DURATION")" \
+    "$DASHBOARD_WORKERS" "$HARD_MAX_WORKERS"
+  dashboard_line 7 "$right_column" "$line"
+  printf -v line '│ 磁盘剩余 %-10s MiB   状态 %s%s%s' \
+    "$DASHBOARD_DISK" "$state_color" "$DASHBOARD_STATE" "$reset"
+  dashboard_line 8 "$right_column" "$line"
+  printf -v line '│ %s下载 60秒%s  %s%s%s' "$green" "$reset" "$green" "$history_down" "$reset"
+  dashboard_line 9 "$right_column" "$line"
+  printf -v line '│ %s上传 60秒%s  %s%s%s' "$cyan" "$reset" "$cyan" "$history_up" "$reset"
+  dashboard_line 10 "$right_column" "$line"
+  dashboard_line 11 "$right_column" '└──────────────────────────────────────────────────────────────────────────┘'
+
+  printf -v line '%s[%s]%s %s | %s + %s | 自动并发 %s | 单键选择，R 刷新' \
+    "$state_color" "$DASHBOARD_STATE" "$reset" \
+    "$DASHBOARD_MODE" "$DASHBOARD_CC" "$DASHBOARD_QDISC" "$DASHBOARD_WORKERS"
+  dashboard_line 13 1 "$line"
+  dashboard_line 14 1 '请选择: '
+}
+
+render_dashboard_compact() {
+  local green cyan reset
+  green=$'\033[1;32m'
+  cyan=$'\033[1;36m'
+  reset=$'\033[0m'
+  printf '\033[2J\033[H'
+  cat <<'EOF'
+SP Traffic
+  1) 状态
+  2) 开始/继续
+  3) 暂停
+  4) 停止
+  5) 清除统计/临时文件
+  6) 端点管理
+  7) 并发与限速
+  8) 最近日志
+  9) 卸载
+  0) 退出
+EOF
+  printf '\n实时: %s↓ %s%s  %s↑ %s%s\n' \
+    "$green" "$(format_rate "$DASHBOARD_DOWNLOAD_RATE")" "$reset" \
+    "$cyan" "$(format_rate "$DASHBOARD_UPLOAD_RATE")" "$reset"
+  printf '本次: 下载 %s  上传 %s\n' \
+    "$(human_bytes "$DASHBOARD_SESSION_DOWNLOAD")" \
+    "$(human_bytes "$DASHBOARD_SESSION_UPLOAD")"
+  printf '总计: 下载 %s  上传 %s\n' \
+    "$(human_bytes "$DASHBOARD_TOTAL_DOWNLOAD")" \
+    "$(human_bytes "$DASHBOARD_TOTAL_UPLOAD")"
+  printf '状态: %s  时长: %s  并发: %s/%s\n' \
+    "$DASHBOARD_STATE" "$(format_duration "$DASHBOARD_DURATION")" \
+    "$DASHBOARD_WORKERS" "$HARD_MAX_WORKERS"
+  printf '请选择: '
+}
+
+render_dashboard() {
+  local columns
+  load_dashboard_stats
+  columns="$(tput cols 2>/dev/null || printf '80')"
+  valid_uint "$columns" || columns=80
+  if [ "$columns" -ge 112 ]; then
+    render_dashboard_wide
+  else
+    render_dashboard_compact
+  fi
+}
+
+wait_for_return() {
+  [ -t 0 ] || return 0
+  printf '\n按任意键返回菜单...'
+  IFS= read -rsn1 _ || true
+}
+
+run_menu_action() {
+  local choice="$1"
+  printf '\033[2J\033[H'
+  case "$choice" in
+    1) show_status; wait_for_return ;;
+    2) start_or_resume_command; wait_for_return ;;
+    3) pause_command; wait_for_return ;;
+    4) stop_command; wait_for_return ;;
+    5) clear_command; wait_for_return ;;
+    6) endpoint_menu ;;
+    7) configure_limits; wait_for_return ;;
+    8) show_logs; wait_for_return ;;
+    9) uninstall_command; return 2 ;;
+    0) return 1 ;;
+    r|R) ;;
+    *) return 0 ;;
+  esac
+}
+
+legacy_main_menu() {
   while :; do
     cat <<'EOF'
 
 SP Traffic
   1) 状态
-  2) 开始
+  2) 开始/继续
   3) 暂停
-  4) 继续
-  5) 停止
-  6) 清除统计/临时文件
-  7) 端点管理
-  8) 并发与限速
-  9) 最近日志
- 10) 卸载
+  4) 停止
+  5) 清除统计/临时文件
+  6) 端点管理
+  7) 并发与限速
+  8) 最近日志
+  9) 卸载
   0) 退出
 EOF
     read -r -p "请选择: " choice
     case "$choice" in
       1) show_status ;;
-      2) start_command ;;
+      2) start_or_resume_command ;;
       3) pause_command ;;
-      4) resume_command ;;
-      5) stop_command ;;
-      6) clear_command ;;
-      7) endpoint_menu ;;
-      8) require_root; configure_limits ;;
-      9) show_logs ;;
-      10) uninstall_command; return ;;
+      4) stop_command ;;
+      5) clear_command ;;
+      6) endpoint_menu ;;
+      7) configure_limits ;;
+      8) show_logs ;;
+      9) uninstall_command; return ;;
       0) return ;;
       *) warn "无效选项" ;;
+    esac
+  done
+}
+
+main_menu() {
+  local choice action_status
+  if [ ! -t 0 ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ]; then
+    legacy_main_menu
+    return
+  fi
+
+  while :; do
+    render_dashboard
+    choice=""
+    if ! IFS= read -rsn1 -t 1 choice; then
+      continue
+    fi
+    run_menu_action "$choice"
+    action_status=$?
+    case "$action_status" in
+      1|2)
+        printf '\033[2J\033[H'
+        return
+        ;;
     esac
   done
 }
@@ -457,8 +819,9 @@ esac
 
 case "${1:-menu}" in
   menu) main_menu ;;
+  dashboard) render_dashboard; printf '\n' ;;
   status) show_status ;;
-  start) shift; start_command "$@" ;;
+  start) shift; start_or_resume_command "$@" ;;
   pause) shift; pause_command "$@" ;;
   resume|continue) shift; resume_command "$@" ;;
   stop) shift; stop_command "$@" ;;
@@ -478,9 +841,9 @@ case "${1:-menu}" in
   uninstall) shift; uninstall_command "$@" ;;
   -h|--help|help)
     cat <<'EOF'
-用法: sp [status|start|pause|resume|stop|clear|endpoints|configure|logs|uninstall]
+用法: sp [dashboard|status|start|pause|resume|stop|clear|endpoints|configure|logs|uninstall]
 端点: sp endpoints {list|default|add URL|remove URL}
-不带参数时打开交互菜单。
+不带参数时打开每秒刷新的交互看板；菜单使用单键选择。
 EOF
     ;;
   *) die "未知命令: $1（使用 sp --help 查看帮助）" ;;
