@@ -16,6 +16,8 @@ jobs:
         run: bash tests/test.sh
       - name: Run worker integration test
         run: PYTHON_BIN=python3 bash tests/integration.sh
+      - name: Run dashboard refresh PTY test
+        run: PYTHON_BIN=python3 bash tests/dashboard_refresh.sh
       - name: Run crash-recovery stress test
         run: PYTHON_BIN=python3 bash tests/stress.sh
       - name: Run ShellCheck

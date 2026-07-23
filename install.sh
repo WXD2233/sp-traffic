@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SP_VERSION="1.5.0"
+readonly SP_VERSION="1.6.0"
 readonly SP_REPOSITORY="${SP_REPOSITORY:-WXD2233/sp-traffic}"
 readonly SP_BRANCH="${SP_BRANCH:-main}"
 readonly SP_RAW_BASE="${SP_RAW_BASE:-https://raw.githubusercontent.com/${SP_REPOSITORY}/${SP_BRANCH}}"
@@ -183,6 +183,8 @@ WORKERS=${WORKERS}
 MAX_MBPS=${MAX_MBPS}
 # 1 = 激进下载（更多并发和更快重试）；0 = 均衡下载
 AGGRESSIVE_MODE=${AGGRESSIVE_MODE}
+# 看板自动刷新间隔秒；0 = 关闭。仅在服务运行且未暂停时刷新
+DASHBOARD_REFRESH_SECONDS=10
 # 可用磁盘低于该值时立即终止传输并自动暂停；0 = 禁用
 MIN_FREE_DISK_MB=200
 CONNECT_TIMEOUT=15
@@ -196,6 +198,10 @@ EOF
   fi
   if ! grep -Eq '^AGGRESSIVE_MODE=[01]$' "${SP_CONFIG_DIR}/config"; then
     printf '\n# 1 = 激进下载（更多并发和更快重试）；0 = 均衡下载\nAGGRESSIVE_MODE=1\n' \
+      >>"${SP_CONFIG_DIR}/config"
+  fi
+  if ! grep -Eq '^DASHBOARD_REFRESH_SECONDS=[0-9]+$' "${SP_CONFIG_DIR}/config"; then
+    printf '\n# 看板自动刷新间隔秒；0 = 关闭。仅在服务运行且未暂停时刷新\nDASHBOARD_REFRESH_SECONDS=10\n' \
       >>"${SP_CONFIG_DIR}/config"
   fi
 

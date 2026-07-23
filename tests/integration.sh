@@ -159,7 +159,12 @@ sysctl() {
 tput() {
   printf '130\n'
 }
-export -f id systemctl sysctl tput
+install() {
+  local -a arguments=("$@")
+  local count="${#arguments[@]}"
+  command cp -- "${arguments[count-2]}" "${arguments[count-1]}"
+}
+export -f id systemctl sysctl tput install
 export MOCK_ACTIVE=1
 mock_now="$(date +%s)"
 printf '12345\n' >"$TEST_DIR/data/counters/download-session-worker-1"
@@ -177,10 +182,27 @@ read -r stopped_download stopped_upload stopped_duration _ <"$TEST_DIR/data/last
 export MOCK_ACTIVE=0
 SP_CONFIG_DIR="$TEST_DIR/config" \
 SP_DATA_DIR="$TEST_DIR/data" \
+  "$ROOT_DIR/sp" refresh 0 >"$TEST_DIR/refresh.txt"
+grep -q '^DASHBOARD_REFRESH_SECONDS=0$' "$TEST_DIR/config/config"
+SP_CONFIG_DIR="$TEST_DIR/config" \
+SP_DATA_DIR="$TEST_DIR/data" \
+  "$ROOT_DIR/sp" refresh 12 >>"$TEST_DIR/refresh.txt"
+grep -q '^DASHBOARD_REFRESH_SECONDS=12$' "$TEST_DIR/config/config"
+if SP_CONFIG_DIR="$TEST_DIR/config" \
+  SP_DATA_DIR="$TEST_DIR/data" \
+  "$ROOT_DIR/sp" refresh 3601 >/dev/null 2>&1; then
+  echo "refresh interval above 3600 seconds should fail" >&2
+  exit 1
+fi
+
+SP_CONFIG_DIR="$TEST_DIR/config" \
+SP_DATA_DIR="$TEST_DIR/data" \
   "$ROOT_DIR/sp" dashboard >"$TEST_DIR/dashboard.txt"
 grep -q '开始/继续' "$TEST_DIR/dashboard.txt"
 grep -q '本次运行' "$TEST_DIR/dashboard.txt"
 grep -q '上次记录' "$TEST_DIR/dashboard.txt"
+grep -q 'T) 刷新间隔' "$TEST_DIR/dashboard.txt"
+grep -q '刷新 已停止' "$TEST_DIR/dashboard.txt"
 grep -Eq '本次运行.*下载[[:space:]]+0\.00 B.*上传[[:space:]]+0\.00 B' \
   "$TEST_DIR/dashboard.txt"
 if grep -q '历史总计' "$TEST_DIR/dashboard.txt"; then

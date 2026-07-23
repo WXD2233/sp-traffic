@@ -15,6 +15,8 @@ readonly SESSION_STARTED_FILE="${DATA_DIR}/session_started"
 readonly LAST_SESSION_FILE="${DATA_DIR}/last_session"
 readonly LAST_EXIT_FILE="${DATA_DIR}/last_exit"
 readonly HARD_MAX_WORKERS=32
+readonly DEFAULT_DASHBOARD_REFRESH_SECONDS=10
+readonly MAX_DASHBOARD_REFRESH_SECONDS=3600
 readonly DEFAULT_ENDPOINT="${SP_DEFAULT_ENDPOINT:-https://sin-speed.hetzner.com/10GB.bin}"
 
 color() {
@@ -92,6 +94,23 @@ config_uint() {
   else
     printf '%s\n' "$fallback"
   fi
+}
+
+dashboard_refresh_seconds() {
+  local seconds
+  seconds="$(config_uint DASHBOARD_REFRESH_SECONDS "$DEFAULT_DASHBOARD_REFRESH_SECONDS")"
+  if [ "$seconds" -gt "$MAX_DASHBOARD_REFRESH_SECONDS" ]; then
+    seconds="$DEFAULT_DASHBOARD_REFRESH_SECONDS"
+  fi
+  printf '%s\n' "$seconds"
+}
+
+dashboard_auto_refresh_active() {
+  local seconds
+  seconds="$(dashboard_refresh_seconds)"
+  [ "$seconds" -gt 0 ] || return 1
+  service_is_active || return 1
+  [ ! -f "$PAUSE_FILE" ]
 }
 
 available_disk_mb() {
@@ -259,7 +278,7 @@ show_status() {
   local state workers=0 qdisc cc available_mb minimum_mb aggressive_mode
   local download_rate upload_rate active_download active_upload
   local session_down session_up duration last_down last_up last_duration
-  local exit_status restart_failures restart_delay
+  local exit_status restart_failures restart_delay refresh_seconds
   local is_active=0
   state="$(service_state_text)"
   service_is_active && is_active=1
@@ -285,6 +304,7 @@ show_status() {
   read -r _ exit_status restart_failures restart_delay <<<"$(read_last_exit)"
   available_mb="$(available_disk_mb 2>/dev/null || printf '未知')"
   minimum_mb="$(config_uint MIN_FREE_DISK_MB 200)"
+  refresh_seconds="$(dashboard_refresh_seconds)"
   aggressive_mode="$(config_uint AGGRESSIVE_MODE 1)"
   if [ "$aggressive_mode" -eq 1 ]; then
     aggressive_mode="激进"
@@ -307,6 +327,7 @@ SP Traffic 状态
   可用磁盘:   ${available_mb} MiB
   暂停阈值:   ${minimum_mb} MiB
   下载模式:   ${aggressive_mode}
+  看板刷新:   ${refresh_seconds} 秒（0 为关闭）
   队列算法:   ${qdisc}
   拥塞控制:   ${cc}
   崩溃恢复:   连续 ${restart_failures} 次（最近退出码 ${exit_status}，退避 ${restart_delay} 秒）
@@ -474,6 +495,25 @@ configure_limits() {
   set_config_value AGGRESSIVE_MODE "$aggressive_mode"
   service_is_active && service_restart
   ok "配置已保存"
+}
+
+configure_refresh_interval() {
+  local seconds="${1:-}" current
+  current="$(dashboard_refresh_seconds)"
+  if [ -z "$seconds" ]; then
+    read -r -p \
+      "看板刷新间隔秒（0=关闭，1-${MAX_DASHBOARD_REFRESH_SECONDS}，当前 ${current}）: " \
+      seconds
+  fi
+  valid_uint "$seconds" || die "刷新间隔必须是非负整数"
+  [ "$seconds" -le "$MAX_DASHBOARD_REFRESH_SECONDS" ] ||
+    die "刷新间隔最大为 ${MAX_DASHBOARD_REFRESH_SECONDS} 秒"
+  set_config_value DASHBOARD_REFRESH_SECONDS "$seconds"
+  if [ "$seconds" -eq 0 ]; then
+    ok "看板自动刷新已关闭；仍可按 R 手动刷新"
+  else
+    ok "看板将在程序运行时每 ${seconds} 秒刷新；暂停、停止或进入其他界面时不刷新"
+  fi
 }
 
 endpoint_menu() {
@@ -657,9 +697,20 @@ load_dashboard_stats() {
   fi
   DASHBOARD_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
   DASHBOARD_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
+  DASHBOARD_REFRESH_SECONDS="$(dashboard_refresh_seconds)"
+  if [ "$DASHBOARD_REFRESH_SECONDS" -eq 0 ]; then
+    DASHBOARD_REFRESH_LABEL="关闭"
+  elif [ "$is_active" -eq 0 ]; then
+    DASHBOARD_REFRESH_LABEL="已停止"
+  elif [ -f "$PAUSE_FILE" ]; then
+    DASHBOARD_REFRESH_LABEL="已暂停"
+  else
+    DASHBOARD_REFRESH_LABEL="每 ${DASHBOARD_REFRESH_SECONDS} 秒"
+  fi
 }
 
 render_dashboard_wide() {
+  local refresh_mode="${1:-full}"
   local right_column=34 maximum_rate configured_mbps bar_down bar_up history_down history_up
   local line green cyan yellow reset state_color
   green=$'\033[1;32m'
@@ -687,7 +738,11 @@ render_dashboard_wide() {
     *) state_color="$cyan" ;;
   esac
 
-  printf '\033[2J\033[H'
+  if [ "$refresh_mode" = "inplace" ]; then
+    printf '\033[H'
+  else
+    printf '\033[2J\033[H'
+  fi
   dashboard_line 1 1 'SP Traffic'
   dashboard_line 2 1 '  1) 状态'
   dashboard_line 3 1 '  2) 开始/继续'
@@ -698,7 +753,8 @@ render_dashboard_wide() {
   dashboard_line 8 1 '  7) 并发与限速'
   dashboard_line 9 1 '  8) 最近日志'
   dashboard_line 10 1 '  9) 卸载'
-  dashboard_line 11 1 '  0) 退出'
+  dashboard_line 11 1 '  T) 刷新间隔'
+  dashboard_line 12 1 '  0) 退出'
 
   dashboard_line 1 "$right_column" '┌─ 实时流量监控 ─────────────────────────────────────────────────────────┐'
   printf -v line '│ %s↓ 下载%s  %-12s  %s[%s]%s' \
@@ -733,19 +789,26 @@ render_dashboard_wide() {
   dashboard_line 10 "$right_column" "$line"
   dashboard_line 11 "$right_column" '└──────────────────────────────────────────────────────────────────────────┘'
 
-  printf -v line '%s[%s]%s %s | %s + %s | 自动并发 %s | 单键选择，R 刷新' \
+  printf -v line '%s[%s]%s %s | %s + %s | 自动并发 %s | 刷新 %s，R 手动，T 设置' \
     "$state_color" "$DASHBOARD_STATE" "$reset" \
-    "$DASHBOARD_MODE" "$DASHBOARD_CC" "$DASHBOARD_QDISC" "$DASHBOARD_WORKERS"
-  dashboard_line 13 1 "$line"
-  dashboard_line 14 1 '请选择: '
+    "$DASHBOARD_MODE" "$DASHBOARD_CC" "$DASHBOARD_QDISC" "$DASHBOARD_WORKERS" \
+    "$DASHBOARD_REFRESH_LABEL"
+  dashboard_line 14 1 "$line"
+  dashboard_line 15 1 '请选择: '
+  printf '\033[J'
 }
 
 render_dashboard_compact() {
+  local refresh_mode="${1:-full}"
   local green cyan reset
   green=$'\033[1;32m'
   cyan=$'\033[1;36m'
   reset=$'\033[0m'
-  printf '\033[2J\033[H'
+  if [ "$refresh_mode" = "inplace" ]; then
+    printf '\033[H'
+  else
+    printf '\033[2J\033[H'
+  fi
   cat <<'EOF'
 SP Traffic
   1) 状态
@@ -757,6 +820,7 @@ SP Traffic
   7) 并发与限速
   8) 最近日志
   9) 卸载
+  T) 刷新间隔
   0) 退出
 EOF
   printf '\n实时: %s↓ %s%s  %s↑ %s%s\n' \
@@ -772,18 +836,20 @@ EOF
   printf '状态: %s  本次时长: %s  并发: %s/%s  恢复: %s 次\n' \
     "$DASHBOARD_STATE" "$(format_duration "$DASHBOARD_DURATION")" \
     "$DASHBOARD_WORKERS" "$HARD_MAX_WORKERS" "$DASHBOARD_RESTART_FAILURES"
+  printf '刷新: %s（R 手动刷新，T 设置）\n' "$DASHBOARD_REFRESH_LABEL"
   printf '请选择: '
+  printf '\033[J'
 }
 
 render_dashboard() {
-  local columns
+  local refresh_mode="${1:-full}" columns
   load_dashboard_stats
   columns="$(tput cols 2>/dev/null || printf '80')"
   valid_uint "$columns" || columns=80
   if [ "$columns" -ge 112 ]; then
-    render_dashboard_wide
+    render_dashboard_wide "$refresh_mode"
   else
-    render_dashboard_compact
+    render_dashboard_compact "$refresh_mode"
   fi
 }
 
@@ -806,6 +872,7 @@ run_menu_action() {
     7) configure_limits; wait_for_return ;;
     8) show_logs; wait_for_return ;;
     9) uninstall_command; return 2 ;;
+    t|T) configure_refresh_interval; wait_for_return ;;
     0) return 1 ;;
     r|R) ;;
     *) return 0 ;;
@@ -826,6 +893,7 @@ SP Traffic
   7) 并发与限速
   8) 最近日志
   9) 卸载
+  T) 刷新间隔
   0) 退出
 EOF
     read -r -p "请选择: " choice
@@ -839,6 +907,7 @@ EOF
       7) configure_limits ;;
       8) show_logs ;;
       9) uninstall_command; return ;;
+      t|T) configure_refresh_interval ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -846,20 +915,32 @@ EOF
 }
 
 main_menu() {
-  local choice action_status
+  local choice action_status read_status refresh_seconds render_mode="full"
   if [ ! -t 0 ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ]; then
     legacy_main_menu
     return
   fi
 
   while :; do
-    render_dashboard
+    render_dashboard "$render_mode"
+    render_mode="inplace"
     choice=""
-    if ! IFS= read -rsn1 choice; then
+    if dashboard_auto_refresh_active; then
+      refresh_seconds="$(dashboard_refresh_seconds)"
+      IFS= read -rsn1 -t "$refresh_seconds" choice
+      read_status=$?
+      if [ "$read_status" -ne 0 ]; then
+        if [ "$read_status" -gt 128 ]; then
+          continue
+        fi
+        return
+      fi
+    elif ! IFS= read -rsn1 choice; then
       return
     fi
     run_menu_action "$choice"
     action_status=$?
+    render_mode="full"
     case "$action_status" in
       1|2)
         printf '\033[2J\033[H'
@@ -894,13 +975,15 @@ case "${1:-menu}" in
     esac
     ;;
   configure) require_root "$@"; configure_limits ;;
+  refresh) shift; configure_refresh_interval "${1:-}" ;;
   logs) show_logs ;;
   uninstall) shift; uninstall_command "$@" ;;
   -h|--help|help)
     cat <<'EOF'
-用法: sp [dashboard|status|start|pause|resume|stop|clear|endpoints|configure|logs|uninstall]
+用法: sp [dashboard|status|start|pause|resume|stop|clear|endpoints|configure|refresh|logs|uninstall]
 端点: sp endpoints {list|default|add URL|remove URL}
-不带参数时打开交互看板；菜单使用单键选择，按 R 手动刷新。
+刷新: sp refresh [秒数]（0=关闭，默认 10 秒）
+不带参数时打开交互看板；运行中自动刷新，暂停/停止/其他界面不刷新，按 R 可手动刷新。
 EOF
     ;;
   *) die "未知命令: $1（使用 sp --help 查看帮助）" ;;

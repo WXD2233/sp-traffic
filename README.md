@@ -59,7 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/WXD2233/sp-traffic/main/install.sh 
 sudo sp
 ```
 
-交互看板默认静态显示，不会持续清屏闪烁；按 `R`、执行菜单操作或重新打开时才刷新。可直接按数字键操作，无需回车。宽终端使用左右分栏，较窄的 SSH 窗口自动切换为紧凑布局。也可打印一次看板快照：
+交互看板在服务运行时默认每 10 秒原位刷新，不会频繁清屏闪烁；暂停、停止或进入状态/端点/日志等其他界面时自动停止刷新。按 `T` 可修改刷新秒数，设为 `0` 可关闭；按 `R` 随时手动刷新。可直接按数字键操作，无需回车。宽终端使用左右分栏，较窄的 SSH 窗口自动切换为紧凑布局。也可打印一次看板快照：
 
 ```bash
 sudo sp dashboard
@@ -72,6 +72,7 @@ sudo sp endpoints add https://your-authorized-host.example/large-test.bin
 sudo sp endpoints default
 sudo sp start
 sudo sp status
+sudo sp refresh 10
 sudo sp pause
 sudo sp resume
 sudo sp stop
@@ -146,6 +147,7 @@ net.ipv4.tcp_mtu_probing=1
 bash -n install.sh sp worker.sh
 bash tests/test.sh
 PYTHON_BIN=python3 bash tests/integration.sh
+PYTHON_BIN=python3 bash tests/dashboard_refresh.sh
 PYTHON_BIN=python3 bash tests/stress.sh
 ```
 

@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bash -n "${ROOT_DIR}/install.sh"
 bash -n "${ROOT_DIR}/sp"
 bash -n "${ROOT_DIR}/worker.sh"
+bash -n "${ROOT_DIR}/tests/dashboard_refresh.sh"
 bash -n "${ROOT_DIR}/tests/stress.sh"
 
 help_output="$("${ROOT_DIR}/sp" --help)"
@@ -26,6 +27,7 @@ grep -Fq "$default_endpoint" "${ROOT_DIR}/sp"
 grep -Fq "$default_endpoint" "${ROOT_DIR}/README.md"
 grep -Fq 'MIN_FREE_DISK_MB=200' "${ROOT_DIR}/install.sh"
 grep -Fq 'AGGRESSIVE_MODE=1' "${ROOT_DIR}/install.sh"
+grep -Fq 'DASHBOARD_REFRESH_SECONDS=10' "${ROOT_DIR}/install.sh"
 grep -Fq 'for candidate in bbrz bbr3 bbr2 bbr' "${ROOT_DIR}/install.sh"
 grep -Fq 'HARD_MAX_WORKERS=32' "${ROOT_DIR}/worker.sh"
 grep -Fq 'enforce_disk_guard' "${ROOT_DIR}/worker.sh"
@@ -46,15 +48,13 @@ grep -Fq '2) 开始/继续' "${ROOT_DIR}/sp"
 grep -Fq '本次运行' "${ROOT_DIR}/sp"
 grep -Fq '上次记录' "${ROOT_DIR}/sp"
 grep -Fq 'save_current_as_last' "${ROOT_DIR}/sp"
+grep -Fq 'dashboard_auto_refresh_active' "${ROOT_DIR}/sp"
+grep -Fq 'configure_refresh_interval' "${ROOT_DIR}/sp"
+grep -Fq 'read -rsn1 -t "$refresh_seconds"' "${ROOT_DIR}/sp"
 if grep -Fq '历史总计' "${ROOT_DIR}/sp"; then
   echo "历史总计 should no longer appear in the dashboard" >&2
   exit 1
 fi
-if grep -Fq 'read -rsn1 -t' "${ROOT_DIR}/sp"; then
-  echo "interactive dashboard should not redraw on a read timeout" >&2
-  exit 1
-fi
-
 workers_error="$(bash "${ROOT_DIR}/install.sh" --workers 33 2>&1 || true)"
 grep -q -- '--workers 最大为 32' <<<"$workers_error"
 
