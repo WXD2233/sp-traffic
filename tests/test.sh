@@ -50,7 +50,7 @@ grep -Fq '上次记录' "${ROOT_DIR}/sp"
 grep -Fq 'save_current_as_last' "${ROOT_DIR}/sp"
 grep -Fq 'dashboard_auto_refresh_active' "${ROOT_DIR}/sp"
 grep -Fq 'configure_refresh_interval' "${ROOT_DIR}/sp"
-grep -Fq 'read -rsn1 -t "$refresh_seconds"' "${ROOT_DIR}/sp"
+grep -Fq "read -rsn1 -t \"\$refresh_seconds\"" "${ROOT_DIR}/sp"
 if grep -Fq '历史总计' "${ROOT_DIR}/sp"; then
   echo "历史总计 should no longer appear in the dashboard" >&2
   exit 1
