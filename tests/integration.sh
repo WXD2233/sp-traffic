@@ -27,6 +27,7 @@ dd if=/dev/zero of="$TEST_DIR/www/test.bin" bs=1024 count=256 status=none
 cat >"$TEST_DIR/config/config" <<'EOF'
 WORKERS=1
 MAX_MBPS=0
+MIN_FREE_DISK_MB=200
 CONNECT_TIMEOUT=5
 TRANSFER_TIMEOUT=30
 CYCLE_DELAY=2
@@ -70,4 +71,23 @@ total="$(awk '{sum += $1} END {print sum + 0}' "$TEST_DIR"/data/counters/worker-
   exit 1
 }
 
-printf 'Worker integration passed (%s bytes).\n' "$total"
+rm -f "$TEST_DIR"/data/counters/worker-* "$TEST_DIR/data/paused" "$TEST_DIR/data/pause_reason"
+printf 'MIN_FREE_DISK_MB=999999999\n' >>"$TEST_DIR/config/config"
+
+SP_CONFIG_FILE="$TEST_DIR/config/config" \
+SP_ENDPOINTS_FILE="$TEST_DIR/config/endpoints" \
+SP_DATA_DIR="$TEST_DIR/data" \
+  "${WORKER_COMMAND[@]}" &
+WORKER_PID=$!
+
+sleep 2
+[ -f "$TEST_DIR/data/paused" ] || {
+  echo "expected low-disk guard to create the pause file" >&2
+  exit 1
+}
+grep -q '^disk_low:' "$TEST_DIR/data/pause_reason"
+kill "$WORKER_PID" 2>/dev/null || true
+wait "$WORKER_PID" 2>/dev/null || true
+WORKER_PID=""
+
+printf 'Worker integration passed (%s bytes); low-disk guard passed.\n' "$total"

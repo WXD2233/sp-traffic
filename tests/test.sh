@@ -21,6 +21,9 @@ default_endpoint='https://sin-speed.hetzner.com/10GB.bin'
 grep -Fq "$default_endpoint" "${ROOT_DIR}/install.sh"
 grep -Fq "$default_endpoint" "${ROOT_DIR}/sp"
 grep -Fq "$default_endpoint" "${ROOT_DIR}/README.md"
+grep -Fq 'MIN_FREE_DISK_MB=200' "${ROOT_DIR}/install.sh"
+grep -Fq 'enforce_disk_guard' "${ROOT_DIR}/worker.sh"
+grep -Fq 'ensure_disk_headroom' "${ROOT_DIR}/sp"
 
 if bash "${ROOT_DIR}/install.sh" --workers 17 >/dev/null 2>&1; then
   echo "expected --workers 17 to fail" >&2

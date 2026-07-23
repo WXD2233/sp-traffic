@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SP_VERSION="1.1.0"
+readonly SP_VERSION="1.2.0"
 readonly SP_REPOSITORY="${SP_REPOSITORY:-WXD2233/sp-traffic}"
 readonly SP_BRANCH="${SP_BRANCH:-main}"
 readonly SP_RAW_BASE="${SP_RAW_BASE:-https://raw.githubusercontent.com/${SP_REPOSITORY}/${SP_BRANCH}}"
@@ -175,10 +175,16 @@ write_config() {
 WORKERS=${WORKERS}
 # 总下载限速（Mbps）；0 = 不主动限速
 MAX_MBPS=${MAX_MBPS}
+# 可用磁盘低于该值时立即终止传输并自动暂停；0 = 禁用
+MIN_FREE_DISK_MB=200
 CONNECT_TIMEOUT=15
 TRANSFER_TIMEOUT=900
 CYCLE_DELAY=2
 EOF
+  fi
+  if ! grep -Eq '^MIN_FREE_DISK_MB=[0-9]+$' "${SP_CONFIG_DIR}/config"; then
+    printf '\n# 可用磁盘低于该值时立即终止传输并自动暂停；0 = 禁用\nMIN_FREE_DISK_MB=200\n' \
+      >>"${SP_CONFIG_DIR}/config"
   fi
 
   touch "${SP_CONFIG_DIR}/endpoints"

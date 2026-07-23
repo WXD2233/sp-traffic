@@ -8,6 +8,7 @@ readonly CONFIG_FILE="${CONFIG_DIR}/config"
 readonly ENDPOINTS_FILE="${CONFIG_DIR}/endpoints"
 readonly BACKEND_FILE="${CONFIG_DIR}/backend"
 readonly PAUSE_FILE="${DATA_DIR}/paused"
+readonly PAUSE_REASON_FILE="${DATA_DIR}/pause_reason"
 readonly HARD_MAX_WORKERS=16
 readonly DEFAULT_ENDPOINT="${SP_DEFAULT_ENDPOINT:-https://sin-speed.hetzner.com/10GB.bin}"
 
@@ -75,6 +76,33 @@ valid_uint() {
   esac
 }
 
+config_uint() {
+  local key="$1" fallback="$2" value
+  value="$(awk -F= -v key="$key" '$1==key {print $2; exit}' "$CONFIG_FILE" 2>/dev/null)"
+  value="${value%$'\r'}"
+  if valid_uint "$value"; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+available_disk_mb() {
+  local disk_kb
+  disk_kb="$(df -Pk "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $4}')"
+  valid_uint "$disk_kb" || return 1
+  printf '%s\n' "$((disk_kb / 1024))"
+}
+
+ensure_disk_headroom() {
+  local minimum_mb available_mb
+  minimum_mb="$(config_uint MIN_FREE_DISK_MB 200)"
+  [ "$minimum_mb" -gt 0 ] || return 0
+  available_mb="$(available_disk_mb)" || die "无法读取可用磁盘空间，已拒绝启动"
+  [ "$available_mb" -ge "$minimum_mb" ] ||
+    die "磁盘仅剩 ${available_mb} MiB，低于保护阈值 ${minimum_mb} MiB；请清理空间后重试"
+}
+
 valid_url() {
   case "$1" in
     http://*|https://*) return 0 ;;
@@ -108,9 +136,18 @@ total_downloaded() {
 }
 
 show_status() {
-  local state workers=0 qdisc cc total
+  local state workers=0 qdisc cc total pause_reason="" available_mb minimum_mb
   if service_is_active; then
-    if [ -f "$PAUSE_FILE" ]; then state="已暂停"; else state="运行中"; fi
+    if [ -f "$PAUSE_FILE" ]; then
+      [ -r "$PAUSE_REASON_FILE" ] && read -r pause_reason < "$PAUSE_REASON_FILE"
+      case "$pause_reason" in
+        disk_low:*) state="已暂停（低磁盘保护）" ;;
+        manual) state="已手动暂停" ;;
+        *) state="已暂停" ;;
+      esac
+    else
+      state="运行中"
+    fi
   else
     state="已停止"
   fi
@@ -118,12 +155,16 @@ show_status() {
   qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
   total="$(total_downloaded)"
+  available_mb="$(available_disk_mb 2>/dev/null || printf '未知')"
+  minimum_mb="$(config_uint MIN_FREE_DISK_MB 200)"
   cat <<EOF
 SP Traffic 状态
   服务:       ${state}
   有效并发:   ${workers}
   授权端点:   $(endpoint_count)
   已完成下载: $(human_bytes "$total")
+  可用磁盘:   ${available_mb} MiB
+  暂停阈值:   ${minimum_mb} MiB
   队列算法:   ${qdisc}
   拥塞控制:   ${cc}
 EOF
@@ -136,7 +177,8 @@ ensure_endpoint() {
 start_command() {
   require_root "$@"
   ensure_endpoint
-  rm -f "$PAUSE_FILE"
+  ensure_disk_headroom
+  rm -f "$PAUSE_FILE" "$PAUSE_REASON_FILE"
   service_start
   ok "服务已启动；关闭 SSH 后仍会在后台运行"
 }
@@ -144,6 +186,7 @@ start_command() {
 pause_command() {
   require_root "$@"
   service_is_active || die "服务没有运行"
+  printf 'manual\n' > "$PAUSE_REASON_FILE"
   touch "$PAUSE_FILE"
   local file pid
   for file in "${DATA_DIR}"/pids/curl-*.pid; do
@@ -157,7 +200,8 @@ pause_command() {
 resume_command() {
   require_root "$@"
   ensure_endpoint
-  rm -f "$PAUSE_FILE"
+  ensure_disk_headroom
+  rm -f "$PAUSE_FILE" "$PAUSE_REASON_FILE"
   if service_is_active; then
     ok "服务已继续"
   else
@@ -169,7 +213,7 @@ resume_command() {
 stop_command() {
   require_root "$@"
   service_stop
-  rm -f "$PAUSE_FILE"
+  rm -f "$PAUSE_FILE" "$PAUSE_REASON_FILE"
   ok "服务已停止"
 }
 

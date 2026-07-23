@@ -7,11 +7,13 @@ readonly DATA_DIR="${SP_DATA_DIR:-/var/lib/sp-traffic}"
 readonly COUNTER_DIR="${DATA_DIR}/counters"
 readonly PID_DIR="${DATA_DIR}/pids"
 readonly PAUSE_FILE="${DATA_DIR}/paused"
+readonly PAUSE_REASON_FILE="${DATA_DIR}/pause_reason"
 readonly EFFECTIVE_WORKERS_FILE="${DATA_DIR}/effective_workers"
 readonly HARD_MAX_WORKERS=16
 
 WORKERS=0
 MAX_MBPS=0
+MIN_FREE_DISK_MB=200
 CONNECT_TIMEOUT=15
 TRANSFER_TIMEOUT=900
 CYCLE_DELAY=2
@@ -35,6 +37,9 @@ load_config() {
         ;;
       MAX_MBPS)
         valid_uint "$value" && MAX_MBPS="$value"
+        ;;
+      MIN_FREE_DISK_MB)
+        valid_uint "$value" && MIN_FREE_DISK_MB="$value"
         ;;
       CONNECT_TIMEOUT)
         valid_uint "$value" && CONNECT_TIMEOUT="$value"
@@ -71,6 +76,34 @@ available_memory_kb() {
 
 available_disk_kb() {
   df -Pk "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+stop_active_transfers() {
+  local file pid
+  for file in "${PID_DIR}"/curl-*.pid; do
+    [ -f "$file" ] || continue
+    read -r pid < "$file" || continue
+    kill "$pid" 2>/dev/null || true
+  done
+}
+
+enforce_disk_guard() {
+  local disk_kb threshold_kb disk_mb
+  [ "$MIN_FREE_DISK_MB" -gt 0 ] || return 0
+  disk_kb="$(available_disk_kb)"
+  valid_uint "$disk_kb" || return 0
+  threshold_kb=$((MIN_FREE_DISK_MB * 1024))
+  [ "$disk_kb" -ge "$threshold_kb" ] && return 0
+
+  disk_mb=$((disk_kb / 1024))
+  if [ ! -f "$PAUSE_FILE" ]; then
+    printf 'disk_low:%s:%s\n' "$disk_mb" "$MIN_FREE_DISK_MB" >"${PAUSE_REASON_FILE}.tmp"
+    mv -f "${PAUSE_REASON_FILE}.tmp" "$PAUSE_REASON_FILE"
+    touch "$PAUSE_FILE"
+    echo "sp-traffic: auto-paused with ${disk_mb} MiB free (threshold ${MIN_FREE_DISK_MB} MiB)" >&2
+  fi
+  stop_active_transfers
+  return 1
 }
 
 cpu_count() {
@@ -159,7 +192,7 @@ download_once() {
     --max-time "$TRANSFER_TIMEOUT" \
     --speed-time 30 --speed-limit 1024 \
     --retry 2 --retry-delay 2 \
-    --user-agent "sp-traffic/1.1 authorized-bandwidth-test" \
+    --user-agent "sp-traffic/1.2 authorized-bandwidth-test" \
     "${rate_arg[@]}" \
     "$url" >"$size_file" &
   curl_pid=$!
@@ -222,7 +255,11 @@ supervise() {
   local target slot pid tick
   while :; do
     load_config
-    target="$(compute_target_workers)"
+    if enforce_disk_guard && [ ! -f "$PAUSE_FILE" ]; then
+      target="$(compute_target_workers)"
+    else
+      target=0
+    fi
     printf '%s\n' "$target" > "$EFFECTIVE_WORKERS_FILE"
 
     for ((slot=1; slot<=HARD_MAX_WORKERS; slot++)); do
