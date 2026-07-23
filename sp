@@ -9,7 +9,7 @@ readonly ENDPOINTS_FILE="${CONFIG_DIR}/endpoints"
 readonly BACKEND_FILE="${CONFIG_DIR}/backend"
 readonly PAUSE_FILE="${DATA_DIR}/paused"
 readonly PAUSE_REASON_FILE="${DATA_DIR}/pause_reason"
-readonly HARD_MAX_WORKERS=16
+readonly HARD_MAX_WORKERS=32
 readonly DEFAULT_ENDPOINT="${SP_DEFAULT_ENDPOINT:-https://sin-speed.hetzner.com/10GB.bin}"
 
 color() {
@@ -136,7 +136,7 @@ total_downloaded() {
 }
 
 show_status() {
-  local state workers=0 qdisc cc total pause_reason="" available_mb minimum_mb
+  local state workers=0 qdisc cc total pause_reason="" available_mb minimum_mb aggressive_mode
   if service_is_active; then
     if [ -f "$PAUSE_FILE" ]; then
       [ -r "$PAUSE_REASON_FILE" ] && read -r pause_reason < "$PAUSE_REASON_FILE"
@@ -157,6 +157,12 @@ show_status() {
   total="$(total_downloaded)"
   available_mb="$(available_disk_mb 2>/dev/null || printf '未知')"
   minimum_mb="$(config_uint MIN_FREE_DISK_MB 200)"
+  aggressive_mode="$(config_uint AGGRESSIVE_MODE 1)"
+  if [ "$aggressive_mode" -eq 1 ]; then
+    aggressive_mode="激进"
+  else
+    aggressive_mode="均衡"
+  fi
   cat <<EOF
 SP Traffic 状态
   服务:       ${state}
@@ -165,6 +171,7 @@ SP Traffic 状态
   已完成下载: $(human_bytes "$total")
   可用磁盘:   ${available_mb} MiB
   暂停阈值:   ${minimum_mb} MiB
+  下载模式:   ${aggressive_mode}
   队列算法:   ${qdisc}
   拥塞控制:   ${cc}
 EOF
@@ -297,14 +304,21 @@ set_config_value() {
 }
 
 configure_limits() {
-  local workers max_mbps
-  read -r -p "并发数（0=自适应，1-16）: " workers
+  local workers max_mbps aggressive_mode current_mode
+  read -r -p "并发数（0=自适应，1-32）: " workers
   valid_uint "$workers" || die "并发数必须是非负整数"
   [ "$workers" -le "$HARD_MAX_WORKERS" ] || die "最大并发为 ${HARD_MAX_WORKERS}"
   read -r -p "总下载限速 Mbps（0=不限速）: " max_mbps
   valid_uint "$max_mbps" || die "限速必须是非负整数"
+  current_mode="$(config_uint AGGRESSIVE_MODE 1)"
+  read -r -p "激进下载模式（1=激进，0=均衡，当前 ${current_mode}）: " aggressive_mode
+  case "$aggressive_mode" in
+    0|1) ;;
+    *) die "下载模式只能是 0 或 1" ;;
+  esac
   set_config_value WORKERS "$workers"
   set_config_value MAX_MBPS "$max_mbps"
+  set_config_value AGGRESSIVE_MODE "$aggressive_mode"
   service_is_active && service_restart
   ok "配置已保存"
 }
@@ -348,6 +362,11 @@ restore_bbr() {
       case "$key" in
         PREV_QDISC) sysctl -q -w "net.core.default_qdisc=${value}" 2>/dev/null || true ;;
         PREV_CC) sysctl -q -w "net.ipv4.tcp_congestion_control=${value}" 2>/dev/null || true ;;
+        PREV_RMEM_MAX) sysctl -q -w "net.core.rmem_max=${value}" 2>/dev/null || true ;;
+        PREV_WMEM_MAX) sysctl -q -w "net.core.wmem_max=${value}" 2>/dev/null || true ;;
+        PREV_TCP_RMEM) sysctl -q -w "net.ipv4.tcp_rmem=${value}" 2>/dev/null || true ;;
+        PREV_TCP_WMEM) sysctl -q -w "net.ipv4.tcp_wmem=${value}" 2>/dev/null || true ;;
+        PREV_MTU_PROBING) sysctl -q -w "net.ipv4.tcp_mtu_probing=${value}" 2>/dev/null || true ;;
       esac
     done < "${DATA_DIR}/bbr.previous"
   fi

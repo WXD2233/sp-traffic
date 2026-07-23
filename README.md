@@ -9,9 +9,10 @@
 - `sp` 中文交互菜单：状态、开始、暂停、继续、停止、清除、端点、并发/限速、日志、卸载
 - 内置 `https://sin-speed.hetzner.com/10GB.bin` 作为默认推荐端点
 - systemd、OpenRC 与 SysV 兼容服务，SSH 断开后继续后台运行，并可随系统启动
-- 自动尝试启用内核 BBR 拥塞控制与 `fq` 队列算法
+- 自动探测并优先选择内核已有的 `bbrz`、`bbr3`、`bbr2`、`bbr`，不自动替换第三方内核
+- 默认激进下载模式：最多 32 路自适应连接、更快失败重试和较大的 TCP 收发缓冲
 - 支持 Debian、Ubuntu、RHEL、CentOS、Rocky、AlmaLinux、Fedora、Alpine、Arch、openSUSE 等常见发行版
-- 每 30 秒根据 CPU、可用内存和磁盘空间调整并发，硬上限 16
+- 每 30 秒根据 CPU、可用内存和磁盘空间调整并发，硬上限 32
 - 下载内容不落盘；仅保存很小的配置、PID 和累计字节统计
 - 可用磁盘低于 200 MiB 时立即终止传输并自动暂停，防止小磁盘 VPS 被日志或其他进程拖死
 - 失败重试、退避、连接/传输超时与可选总带宽上限
@@ -42,8 +43,9 @@ curl -fsSL https://raw.githubusercontent.com/WXD2233/sp-traffic/main/install.sh 
 
 ```text
 --url URL          添加授权端点，可重复
---workers N        0=资源自适应，1-16=并发上限
+--workers N        0=资源自适应，1-32=并发上限
 --max-mbps N       总下载限速 Mbps，0=不限速
+--balanced         使用均衡下载模式
 --start            使用内置默认端点，安装后立即启动
 --no-bbr           不修改 BBR/FQ 配置
 --no-start         安装后不启动
@@ -75,23 +77,27 @@ sudo sp uninstall
 
 ## BBR 说明
 
-安装器会加载 `tcp_bbr`，并写入：
+安装器会尝试加载内核已有的 BBR 模块，并按 `bbrz → bbr3 → bbr2 → bbr` 的顺序选择系统实际提供的算法，同时写入：
 
 ```text
 net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_mtu_probing=1
 ```
 
-如果当前内核不支持 BBR，安装器只会给出警告，不会擅自升级内核或重启 VPS。多数现代发行版内核已内置 BBR；老内核需要由你按发行版升级后重启。卸载时会删除本项目创建的 sysctl/module 配置，并尽量恢复安装前的活动值。
+如果当前内核不支持这些 BBR 变体，安装器会保留原拥塞控制，不会擅自安装未知内核或重启 VPS。具体是 BBRv1、BBRv2 还是 BBRv3，取决于 VPS 当前内核的实现。卸载时会删除本项目创建的 sysctl/module 配置，并尽量恢复安装前的拥塞控制、队列和缓冲值。
+
+下载场景中，远端服务器才是主要 TCP 发送方，因此本机拥塞算法不能让远端“无视丢包”。激进模式主要通过多条并行连接、较大接收缓冲和更快失败重试，降低单连接丢包对总吞吐的影响。
 
 ## 资源策略
 
-- 默认并发为 `CPU 核心数 × 2`
-- 每个工作槽至少预留约 64 MiB 可用内存
+- 激进模式默认并发为 `CPU 核心数 × 4`，均衡模式为 `CPU 核心数 × 2`
+- 激进模式每个工作槽至少预留约 32 MiB，均衡模式约 64 MiB
 - 可用磁盘少于 256 MiB 时最多 2 个工作槽，少于 64 MiB 时只运行 1 个
 - 可用磁盘低于 `MIN_FREE_DISK_MB`（默认 200 MiB）时，立即终止当前传输并自动暂停
 - 释放空间后需手动运行 `sudo sp resume`；空间仍低于阈值时会拒绝启动或继续
-- 无论配置如何，并发硬上限为 16
+- 无论配置如何，并发硬上限为 32
 - 传输数据始终写入 `/dev/null`，不会用大文件占满磁盘
 - 服务使用较低调度优先级，并提高 OOM 回收倾向，以保护系统关键服务
 

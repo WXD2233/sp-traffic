@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SP_VERSION="1.2.0"
+readonly SP_VERSION="1.3.0"
 readonly SP_REPOSITORY="${SP_REPOSITORY:-WXD2233/sp-traffic}"
 readonly SP_BRANCH="${SP_BRANCH:-main}"
 readonly SP_RAW_BASE="${SP_RAW_BASE:-https://raw.githubusercontent.com/${SP_REPOSITORY}/${SP_BRANCH}}"
@@ -14,6 +14,7 @@ readonly DEFAULT_ENDPOINT="${SP_DEFAULT_ENDPOINT:-https://sin-speed.hetzner.com/
 URLS=()
 WORKERS="0"
 MAX_MBPS="0"
+AGGRESSIVE_MODE="1"
 ENABLE_BBR="1"
 AUTO_START="1"
 START_DEFAULT="0"
@@ -42,6 +43,7 @@ usage() {
   --url URL          添加一个经授权的 HTTP/HTTPS 下载端点，可重复使用
   --workers N        并发数；0 表示根据 CPU、内存和磁盘自动调整（默认）
   --max-mbps N       总下载限速，单位 Mbps；0 表示不主动限速（默认）
+  --balanced         使用均衡下载模式；默认启用激进下载模式
   --start             使用内置默认端点，安装后立即启动
   --no-bbr           不配置 BBR + FQ
   --no-start         安装后不自动启动
@@ -74,7 +76,7 @@ while [ "$#" -gt 0 ]; do
     --workers)
       [ "$#" -ge 2 ] || die "--workers 缺少参数"
       validate_uint "$2" || die "--workers 必须是非负整数"
-      [ "$2" -le 16 ] || die "--workers 最大为 16"
+      [ "$2" -le 32 ] || die "--workers 最大为 32"
       WORKERS="$2"
       shift 2
       ;;
@@ -86,6 +88,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --no-bbr)
       ENABLE_BBR="0"
+      shift
+      ;;
+    --balanced)
+      AGGRESSIVE_MODE="0"
       shift
       ;;
     --start)
@@ -171,10 +177,12 @@ write_config() {
   chown root:sptraffic "$SP_CONFIG_DIR"
   if [ ! -f "${SP_CONFIG_DIR}/config" ]; then
     cat >"${SP_CONFIG_DIR}/config" <<EOF
-# 0 = 根据 CPU、可用内存和可用磁盘自动调整；最大并发硬限制为 16
+# 0 = 根据 CPU、可用内存和可用磁盘自动调整；最大并发硬限制为 32
 WORKERS=${WORKERS}
 # 总下载限速（Mbps）；0 = 不主动限速
 MAX_MBPS=${MAX_MBPS}
+# 1 = 激进下载（更多并发和更快重试）；0 = 均衡下载
+AGGRESSIVE_MODE=${AGGRESSIVE_MODE}
 # 可用磁盘低于该值时立即终止传输并自动暂停；0 = 禁用
 MIN_FREE_DISK_MB=200
 CONNECT_TIMEOUT=15
@@ -184,6 +192,10 @@ EOF
   fi
   if ! grep -Eq '^MIN_FREE_DISK_MB=[0-9]+$' "${SP_CONFIG_DIR}/config"; then
     printf '\n# 可用磁盘低于该值时立即终止传输并自动暂停；0 = 禁用\nMIN_FREE_DISK_MB=200\n' \
+      >>"${SP_CONFIG_DIR}/config"
+  fi
+  if ! grep -Eq '^AGGRESSIVE_MODE=[01]$' "${SP_CONFIG_DIR}/config"; then
+    printf '\n# 1 = 激进下载（更多并发和更快重试）；0 = 均衡下载\nAGGRESSIVE_MODE=1\n' \
       >>"${SP_CONFIG_DIR}/config"
   fi
 
@@ -211,26 +223,103 @@ configure_bbr() {
   install -d -m 0755 /etc/sysctl.d
   install -d -m 0755 /etc/modules-load.d
 
-  {
-    printf 'PREV_QDISC=%s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-    printf 'PREV_CC=%s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-  } >"${SP_DATA_DIR}/bbr.previous"
+  touch "${SP_DATA_DIR}/bbr.previous"
+  if ! grep -q '^PREV_QDISC=' "${SP_DATA_DIR}/bbr.previous"; then
+    printf 'PREV_QDISC=%s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" \
+      >>"${SP_DATA_DIR}/bbr.previous"
+  fi
+  if ! grep -q '^PREV_CC=' "${SP_DATA_DIR}/bbr.previous"; then
+    printf 'PREV_CC=%s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" \
+      >>"${SP_DATA_DIR}/bbr.previous"
+  fi
+  if ! grep -q '^PREV_RMEM_MAX=' "${SP_DATA_DIR}/bbr.previous"; then
+    printf 'PREV_RMEM_MAX=%s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || true)" \
+      >>"${SP_DATA_DIR}/bbr.previous"
+  fi
+  if ! grep -q '^PREV_WMEM_MAX=' "${SP_DATA_DIR}/bbr.previous"; then
+    printf 'PREV_WMEM_MAX=%s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || true)" \
+      >>"${SP_DATA_DIR}/bbr.previous"
+  fi
+  if ! grep -q '^PREV_TCP_RMEM=' "${SP_DATA_DIR}/bbr.previous"; then
+    printf 'PREV_TCP_RMEM=%s\n' "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || true)" \
+      >>"${SP_DATA_DIR}/bbr.previous"
+  fi
+  if ! grep -q '^PREV_TCP_WMEM=' "${SP_DATA_DIR}/bbr.previous"; then
+    printf 'PREV_TCP_WMEM=%s\n' "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || true)" \
+      >>"${SP_DATA_DIR}/bbr.previous"
+  fi
+  if ! grep -q '^PREV_MTU_PROBING=' "${SP_DATA_DIR}/bbr.previous"; then
+    printf 'PREV_MTU_PROBING=%s\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || true)" \
+      >>"${SP_DATA_DIR}/bbr.previous"
+  fi
   chown root:root "${SP_DATA_DIR}/bbr.previous"
   chmod 0600 "${SP_DATA_DIR}/bbr.previous"
 
-  printf 'tcp_bbr\n' > /etc/modules-load.d/sp-traffic-bbr.conf
+  modprobe tcp_bbrz 2>/dev/null || true
+  modprobe tcp_bbr3 2>/dev/null || true
+  modprobe tcp_bbr2 2>/dev/null || true
   modprobe tcp_bbr 2>/dev/null || true
+  local available selected="" module="" candidate
+  available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  for candidate in bbrz bbr3 bbr2 bbr; do
+    case " ${available} " in
+      *" ${candidate} "*)
+        selected="$candidate"
+        break
+        ;;
+    esac
+  done
+
+  case "$selected" in
+    bbrz)
+      if [ -d /sys/module/tcp_bbrz ]; then module="tcp_bbrz"; fi
+      ;;
+    bbr3)
+      if [ -d /sys/module/tcp_bbr3 ]; then
+        module="tcp_bbr3"
+      elif [ -d /sys/module/tcp_bbr ]; then
+        module="tcp_bbr"
+      fi
+      ;;
+    bbr2)
+      if [ -d /sys/module/tcp_bbr2 ]; then
+        module="tcp_bbr2"
+      elif [ -d /sys/module/tcp_bbr ]; then
+        module="tcp_bbr"
+      fi
+      ;;
+    bbr)
+      if [ -d /sys/module/tcp_bbr ]; then module="tcp_bbr"; fi
+      ;;
+  esac
+  if [ -n "$module" ]; then
+    printf '%s\n' "$module" > /etc/modules-load.d/sp-traffic-bbr.conf
+  else
+    rm -f /etc/modules-load.d/sp-traffic-bbr.conf
+  fi
 
   cat > /etc/sysctl.d/99-sp-traffic-bbr.conf <<'EOF'
 # Managed by sp-traffic
 net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 1048576 33554432
+net.ipv4.tcp_wmem=4096 1048576 33554432
+net.ipv4.tcp_mtu_probing=1
 EOF
+  if [ -n "$selected" ]; then
+    printf 'net.ipv4.tcp_congestion_control=%s\n' "$selected" \
+      >> /etc/sysctl.d/99-sp-traffic-bbr.conf
+  fi
 
   if sysctl -q -p /etc/sysctl.d/99-sp-traffic-bbr.conf 2>/dev/null; then
-    info "BBR + FQ 已启用"
+    if [ -n "$selected" ]; then
+      info "${selected} + FQ 与大 TCP 缓冲已启用"
+    else
+      warn "当前内核没有 BBRZ/BBR3/BBR2/BBR，已保留原拥塞控制并启用 FQ/缓冲调优"
+    fi
   else
-    warn "当前内核未提供 BBR；未自动升级内核或重启，请先确认内核 >= 4.9"
+    warn "部分网络调优未能应用；未自动替换内核或重启"
   fi
 }
 

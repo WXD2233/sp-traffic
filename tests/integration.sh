@@ -27,6 +27,7 @@ dd if=/dev/zero of="$TEST_DIR/www/test.bin" bs=1024 count=256 status=none
 cat >"$TEST_DIR/config/config" <<'EOF'
 WORKERS=1
 MAX_MBPS=0
+AGGRESSIVE_MODE=1
 MIN_FREE_DISK_MB=200
 CONNECT_TIMEOUT=5
 TRANSFER_TIMEOUT=30

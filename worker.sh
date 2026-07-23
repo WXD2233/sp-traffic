@@ -9,10 +9,11 @@ readonly PID_DIR="${DATA_DIR}/pids"
 readonly PAUSE_FILE="${DATA_DIR}/paused"
 readonly PAUSE_REASON_FILE="${DATA_DIR}/pause_reason"
 readonly EFFECTIVE_WORKERS_FILE="${DATA_DIR}/effective_workers"
-readonly HARD_MAX_WORKERS=16
+readonly HARD_MAX_WORKERS=32
 
 WORKERS=0
 MAX_MBPS=0
+AGGRESSIVE_MODE=1
 MIN_FREE_DISK_MB=200
 CONNECT_TIMEOUT=15
 TRANSFER_TIMEOUT=900
@@ -37,6 +38,11 @@ load_config() {
         ;;
       MAX_MBPS)
         valid_uint "$value" && MAX_MBPS="$value"
+        ;;
+      AGGRESSIVE_MODE)
+        case "$value" in
+          0|1) AGGRESSIVE_MODE="$value" ;;
+        esac
         ;;
       MIN_FREE_DISK_MB)
         valid_uint "$value" && MIN_FREE_DISK_MB="$value"
@@ -119,11 +125,16 @@ compute_target_workers() {
   valid_uint "$memory_kb" || memory_kb=131072
   valid_uint "$disk_kb" || disk_kb=65536
 
-  target=$((cpus * 2))
+  if [ "$AGGRESSIVE_MODE" -eq 1 ]; then
+    target=$((cpus * 4))
+    memory_slots=$((memory_kb / 32768))
+  else
+    target=$((cpus * 2))
+    memory_slots=$((memory_kb / 65536))
+  fi
   [ "$target" -ge 1 ] || target=1
   [ "$target" -le "$HARD_MAX_WORKERS" ] || target="$HARD_MAX_WORKERS"
 
-  memory_slots=$((memory_kb / 65536))
   [ "$memory_slots" -ge 1 ] || memory_slots=1
   [ "$target" -le "$memory_slots" ] || target="$memory_slots"
 
@@ -170,7 +181,7 @@ download_once() {
   local slot="$1" url="$2"
   local size_file="${DATA_DIR}/size-${slot}.tmp"
   local pid_file="${PID_DIR}/curl-${slot}.pid" per_worker_kbps=0
-  local -a rate_arg=()
+  local -a rate_arg=() retry_args=()
   local active_workers=1 curl_pid status bytes
 
   if [ "$MAX_MBPS" -gt 0 ]; then
@@ -183,6 +194,11 @@ download_once() {
     [ "$per_worker_kbps" -ge 1 ] || per_worker_kbps=1
     rate_arg=(--limit-rate "${per_worker_kbps}K")
   fi
+  if [ "$AGGRESSIVE_MODE" -eq 1 ]; then
+    retry_args=(--retry 5 --retry-delay 1)
+  else
+    retry_args=(--retry 2 --retry-delay 2)
+  fi
 
   : > "$size_file"
   curl --fail --location --silent --show-error \
@@ -191,8 +207,8 @@ download_once() {
     --connect-timeout "$CONNECT_TIMEOUT" \
     --max-time "$TRANSFER_TIMEOUT" \
     --speed-time 30 --speed-limit 1024 \
-    --retry 2 --retry-delay 2 \
-    --user-agent "sp-traffic/1.2 authorized-bandwidth-test" \
+    "${retry_args[@]}" \
+    --user-agent "sp-traffic/1.3 authorized-bandwidth-test" \
     "${rate_arg[@]}" \
     "$url" >"$size_file" &
   curl_pid=$!
@@ -222,8 +238,13 @@ run_slot() {
         continue
       fi
       failures=$((failures + 1))
-      delay=$((failures * 2))
-      [ "$delay" -le 60 ] || delay=60
+      if [ "$AGGRESSIVE_MODE" -eq 1 ]; then
+        delay="$failures"
+        [ "$delay" -le 15 ] || delay=15
+      else
+        delay=$((failures * 2))
+        [ "$delay" -le 60 ] || delay=60
+      fi
       sleep "$delay"
     fi
   done
