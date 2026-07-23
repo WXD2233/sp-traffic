@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SP_VERSION="1.0.0"
+readonly SP_VERSION="1.1.0"
 readonly SP_REPOSITORY="${SP_REPOSITORY:-WXD2233/sp-traffic}"
 readonly SP_BRANCH="${SP_BRANCH:-main}"
 readonly SP_RAW_BASE="${SP_RAW_BASE:-https://raw.githubusercontent.com/${SP_REPOSITORY}/${SP_BRANCH}}"
@@ -9,12 +9,14 @@ readonly SP_INSTALL_DIR="${SP_INSTALL_DIR:-/opt/sp-traffic}"
 readonly SP_CONFIG_DIR="${SP_CONFIG_DIR:-/etc/sp-traffic}"
 readonly SP_DATA_DIR="${SP_DATA_DIR:-/var/lib/sp-traffic}"
 readonly SP_BIN_PATH="${SP_BIN_PATH:-/usr/local/bin/sp}"
+readonly DEFAULT_ENDPOINT="${SP_DEFAULT_ENDPOINT:-https://sin-speed.hetzner.com/10GB.bin}"
 
 URLS=()
 WORKERS="0"
 MAX_MBPS="0"
 ENABLE_BBR="1"
 AUTO_START="1"
+START_DEFAULT="0"
 TEMPORARY_DIR=""
 
 info() {
@@ -40,6 +42,7 @@ usage() {
   --url URL          添加一个经授权的 HTTP/HTTPS 下载端点，可重复使用
   --workers N        并发数；0 表示根据 CPU、内存和磁盘自动调整（默认）
   --max-mbps N       总下载限速，单位 Mbps；0 表示不主动限速（默认）
+  --start             使用内置默认端点，安装后立即启动
   --no-bbr           不配置 BBR + FQ
   --no-start         安装后不自动启动
   -h, --help         显示帮助
@@ -83,6 +86,11 @@ while [ "$#" -gt 0 ]; do
       ;;
     --no-bbr)
       ENABLE_BBR="0"
+      shift
+      ;;
+    --start)
+      AUTO_START="1"
+      START_DEFAULT="1"
       shift
       ;;
     --no-start)
@@ -180,6 +188,8 @@ EOF
     for url in "${URLS[@]}"; do
       printf '%s\n' "$url" >>"${SP_CONFIG_DIR}/endpoints"
     done
+  elif ! grep -Eq '^[[:space:]]*https?://' "${SP_CONFIG_DIR}/endpoints"; then
+    printf '%s\n' "$DEFAULT_ENDPOINT" >"${SP_CONFIG_DIR}/endpoints"
   fi
   chown root:sptraffic "${SP_CONFIG_DIR}/config" "${SP_CONFIG_DIR}/endpoints"
   chmod 0640 "${SP_CONFIG_DIR}/config" "${SP_CONFIG_DIR}/endpoints"
@@ -324,6 +334,11 @@ install_service() {
 
 start_if_ready() {
   [ "$AUTO_START" = "1" ] || return 0
+  if [ "${#URLS[@]}" -eq 0 ] && [ "$START_DEFAULT" != "1" ]; then
+    warn "已配置默认 Hetzner 新加坡 10GB 测速端点，服务保持停止"
+    warn "确认流量费用和使用规则后，运行 sudo sp start；安装时可用 --start 明确启动"
+    return 0
+  fi
   if ! grep -Eq '^[[:space:]]*https?://' "${SP_CONFIG_DIR}/endpoints"; then
     warn "尚未配置下载端点，服务保持停止；运行 sudo sp 后添加经授权端点"
     return 0
@@ -358,6 +373,7 @@ main() {
 
   info "安装完成（v${SP_VERSION}）"
   info "管理命令: sudo sp"
+  info "默认端点: ${DEFAULT_ENDPOINT}"
   info "仅可使用你拥有或已获明确授权的下载端点。"
 }
 

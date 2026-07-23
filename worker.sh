@@ -159,7 +159,7 @@ download_once() {
     --max-time "$TRANSFER_TIMEOUT" \
     --speed-time 30 --speed-limit 1024 \
     --retry 2 --retry-delay 2 \
-    --user-agent "sp-traffic/1.0 authorized-bandwidth-test" \
+    --user-agent "sp-traffic/1.1 authorized-bandwidth-test" \
     "${rate_arg[@]}" \
     "$url" >"$size_file" &
   curl_pid=$!

@@ -7,6 +7,7 @@
 ## 功能
 
 - `sp` 中文交互菜单：状态、开始、暂停、继续、停止、清除、端点、并发/限速、日志、卸载
+- 内置 `https://sin-speed.hetzner.com/10GB.bin` 作为默认推荐端点
 - systemd、OpenRC 与 SysV 兼容服务，SSH 断开后继续后台运行，并可随系统启动
 - 自动尝试启用内核 BBR 拥塞控制与 `fq` 队列算法
 - 支持 Debian、Ubuntu、RHEL、CentOS、Rocky、AlmaLinux、Fedora、Alpine、Arch、openSUSE 等常见发行版
@@ -17,10 +18,16 @@
 
 ## 一键安装
 
-安装管理工具和服务（此时不会启动，因为还没有端点）：
+安装管理工具和服务。安装器会写入默认端点，但不会在无人确认时自动启动：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/WXD2233/sp-traffic/main/install.sh | sudo bash
+```
+
+确认流量费用和测速服务使用规则后，手动启动：
+
+```bash
+sudo sp start
 ```
 
 安装时直接配置一个经授权的测试端点并启动：
@@ -36,6 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/WXD2233/sp-traffic/main/install.sh 
 --url URL          添加授权端点，可重复
 --workers N        0=资源自适应，1-16=并发上限
 --max-mbps N       总下载限速 Mbps，0=不限速
+--start            使用内置默认端点，安装后立即启动
 --no-bbr           不修改 BBR/FQ 配置
 --no-start         安装后不启动
 ```
@@ -50,6 +58,7 @@ sudo sp
 
 ```bash
 sudo sp endpoints add https://your-authorized-host.example/large-test.bin
+sudo sp endpoints default
 sudo sp start
 sudo sp status
 sudo sp pause
@@ -60,6 +69,8 @@ sudo sp uninstall
 ```
 
 建议使用足够大的静态文件或专用测速端点。每个工作槽完成一次下载后至少等待 2 秒，小文件不会被用来制造高频请求。
+
+默认的 Hetzner 新加坡 10GB 文件适合短时吞吐测试，不代表可以长期、无限循环占用第三方带宽。长期运行请改用你自己的另一台 VPS、对象存储或明确授权的端点。
 
 ## BBR 说明
 

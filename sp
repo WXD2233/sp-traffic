@@ -9,6 +9,7 @@ readonly ENDPOINTS_FILE="${CONFIG_DIR}/endpoints"
 readonly BACKEND_FILE="${CONFIG_DIR}/backend"
 readonly PAUSE_FILE="${DATA_DIR}/paused"
 readonly HARD_MAX_WORKERS=16
+readonly DEFAULT_ENDPOINT="${SP_DEFAULT_ENDPOINT:-https://sin-speed.hetzner.com/10GB.bin}"
 
 color() {
   local code="$1"
@@ -190,7 +191,11 @@ list_endpoints() {
   while IFS= read -r line || [ -n "$line" ]; do
     valid_url "$line" || continue
     number=$((number + 1))
-    printf '  %d) %s\n' "$number" "$line"
+    if [ "$line" = "$DEFAULT_ENDPOINT" ]; then
+      printf '  %d) %s [默认：Hetzner 新加坡 10GB]\n' "$number" "$line"
+    else
+      printf '  %d) %s\n' "$number" "$line"
+    fi
   done < "$ENDPOINTS_FILE"
   [ "$number" -gt 0 ] || echo "  （无）"
 }
@@ -206,6 +211,11 @@ add_endpoint() {
   chmod 0640 "$ENDPOINTS_FILE"
   service_is_active && service_restart
   ok "端点已添加"
+}
+
+add_default_endpoint() {
+  add_endpoint "$DEFAULT_ENDPOINT"
+  warn "这是第三方公共测速端点，仅建议短时测试；请确认流量费用和提供方规则"
 }
 
 remove_endpoint() {
@@ -261,15 +271,17 @@ endpoint_menu() {
 
 端点管理
   1) 查看
-  2) 添加
-  3) 删除
+  2) 添加默认 Hetzner 新加坡 10GB
+  3) 添加自定义端点
+  4) 删除
   0) 返回
 EOF
     read -r -p "请选择: " choice
     case "$choice" in
       1) list_endpoints ;;
-      2) add_endpoint ;;
-      3) remove_endpoint ;;
+      2) add_default_endpoint ;;
+      3) add_endpoint ;;
+      4) remove_endpoint ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -392,9 +404,10 @@ case "${1:-menu}" in
     shift
     case "${1:-list}" in
       list) list_endpoints ;;
+      default) shift; add_default_endpoint ;;
       add) require_root "$@"; shift; add_endpoint "${1:-}" ;;
       remove) require_root "$@"; shift; remove_endpoint "${1:-}" ;;
-      *) die "用法: sp endpoints {list|add URL|remove URL}" ;;
+      *) die "用法: sp endpoints {list|default|add URL|remove URL}" ;;
     esac
     ;;
   configure) require_root "$@"; configure_limits ;;
@@ -403,6 +416,7 @@ case "${1:-menu}" in
   -h|--help|help)
     cat <<'EOF'
 用法: sp [status|start|pause|resume|stop|clear|endpoints|configure|logs|uninstall]
+端点: sp endpoints {list|default|add URL|remove URL}
 不带参数时打开交互菜单。
 EOF
     ;;
