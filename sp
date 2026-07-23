@@ -13,6 +13,7 @@ readonly LIVE_STATS_FILE="${DATA_DIR}/live_stats"
 readonly RATE_HISTORY_FILE="${DATA_DIR}/rate_history"
 readonly SESSION_STARTED_FILE="${DATA_DIR}/session_started"
 readonly LAST_SESSION_FILE="${DATA_DIR}/last_session"
+readonly LAST_EXIT_FILE="${DATA_DIR}/last_exit"
 readonly HARD_MAX_WORKERS=32
 readonly DEFAULT_ENDPOINT="${SP_DEFAULT_ENDPOINT:-https://sin-speed.hetzner.com/10GB.bin}"
 
@@ -210,6 +211,18 @@ read_last_session() {
   printf '%s %s %s %s\n' "$download" "$upload" "$duration" "$saved_at"
 }
 
+read_last_exit() {
+  local timestamp=0 status=0 failures=0 delay=0
+  if [ -r "$LAST_EXIT_FILE" ]; then
+    read -r timestamp status failures delay < "$LAST_EXIT_FILE" || true
+  fi
+  valid_uint "$timestamp" || timestamp=0
+  valid_uint "$status" || status=0
+  valid_uint "$failures" || failures=0
+  valid_uint "$delay" || delay=0
+  printf '%s %s %s %s\n' "$timestamp" "$status" "$failures" "$delay"
+}
+
 save_current_as_last() {
   local active_download active_upload
   local download upload duration now
@@ -246,6 +259,7 @@ show_status() {
   local state workers=0 qdisc cc available_mb minimum_mb aggressive_mode
   local download_rate upload_rate active_download active_upload
   local session_down session_up duration last_down last_up last_duration
+  local exit_status restart_failures restart_delay
   local is_active=0
   state="$(service_state_text)"
   service_is_active && is_active=1
@@ -268,6 +282,7 @@ show_status() {
     duration=0
   fi
   read -r last_down last_up last_duration _ <<<"$(read_last_session)"
+  read -r _ exit_status restart_failures restart_delay <<<"$(read_last_exit)"
   available_mb="$(available_disk_mb 2>/dev/null || printf '未知')"
   minimum_mb="$(config_uint MIN_FREE_DISK_MB 200)"
   aggressive_mode="$(config_uint AGGRESSIVE_MODE 1)"
@@ -294,6 +309,7 @@ SP Traffic 状态
   下载模式:   ${aggressive_mode}
   队列算法:   ${qdisc}
   拥塞控制:   ${cc}
+  崩溃恢复:   连续 ${restart_failures} 次（最近退出码 ${exit_status}，退避 ${restart_delay} 秒）
 EOF
 }
 
@@ -361,6 +377,7 @@ clear_command() {
   printf '%s\n' "$now" >"$SESSION_STARTED_FILE"
   : > "$RATE_HISTORY_FILE"
   rm -f "$LAST_SESSION_FILE" "${LAST_SESSION_FILE}.tmp"
+  rm -f "$LAST_EXIT_FILE" "${LAST_EXIT_FILE}.tmp"
   rm -f "${DATA_DIR}"/size-*.tmp "${DATA_DIR}"/progress-*.tmp
   if [ "$was_active" -eq 1 ]; then
     if [ "$was_paused" -eq 1 ]; then
@@ -630,6 +647,7 @@ load_dashboard_stats() {
     DASHBOARD_LAST_UPLOAD \
     DASHBOARD_LAST_DURATION \
     _ <<<"$(read_last_session)"
+  read -r _ _ DASHBOARD_RESTART_FAILURES _ <<<"$(read_last_exit)"
   DASHBOARD_DISK="$(available_disk_mb 2>/dev/null || printf '未知')"
   DASHBOARD_MODE="$(config_uint AGGRESSIVE_MODE 1)"
   if [ "$DASHBOARD_MODE" -eq 1 ]; then
@@ -705,8 +723,9 @@ render_dashboard_wide() {
     "$(format_duration "$DASHBOARD_LAST_DURATION")" \
     "$DASHBOARD_WORKERS" "$HARD_MAX_WORKERS"
   dashboard_line 7 "$right_column" "$line"
-  printf -v line '│ 磁盘剩余 %-10s MiB   状态 %s%s%s' \
-    "$DASHBOARD_DISK" "$state_color" "$DASHBOARD_STATE" "$reset"
+  printf -v line '│ 磁盘剩余 %-10s MiB   状态 %s%s%s   恢复 %s 次' \
+    "$DASHBOARD_DISK" "$state_color" "$DASHBOARD_STATE" "$reset" \
+    "$DASHBOARD_RESTART_FAILURES"
   dashboard_line 8 "$right_column" "$line"
   printf -v line '│ %s下载 60秒%s  %s%s%s' "$green" "$reset" "$green" "$history_down" "$reset"
   dashboard_line 9 "$right_column" "$line"
@@ -750,9 +769,9 @@ EOF
     "$(human_bytes "$DASHBOARD_LAST_DOWNLOAD")" \
     "$(human_bytes "$DASHBOARD_LAST_UPLOAD")" \
     "$(format_duration "$DASHBOARD_LAST_DURATION")"
-  printf '状态: %s  本次时长: %s  并发: %s/%s\n' \
+  printf '状态: %s  本次时长: %s  并发: %s/%s  恢复: %s 次\n' \
     "$DASHBOARD_STATE" "$(format_duration "$DASHBOARD_DURATION")" \
-    "$DASHBOARD_WORKERS" "$HARD_MAX_WORKERS"
+    "$DASHBOARD_WORKERS" "$HARD_MAX_WORKERS" "$DASHBOARD_RESTART_FAILURES"
   printf '请选择: '
 }
 

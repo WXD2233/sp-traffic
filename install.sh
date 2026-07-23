@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SP_VERSION="1.4.2"
+readonly SP_VERSION="1.5.0"
 readonly SP_REPOSITORY="${SP_REPOSITORY:-WXD2233/sp-traffic}"
 readonly SP_BRANCH="${SP_BRANCH:-main}"
 readonly SP_RAW_BASE="${SP_RAW_BASE:-https://raw.githubusercontent.com/${SP_REPOSITORY}/${SP_BRANCH}}"
@@ -337,7 +337,9 @@ Group=sptraffic
 WorkingDirectory=${SP_DATA_DIR}
 ExecStart=${SP_INSTALL_DIR}/worker.sh
 Restart=always
-RestartSec=3
+RestartSec=5
+StandardOutput=null
+StandardError=null
 Nice=5
 OOMScoreAdjust=500
 LimitNOFILE=65535

@@ -13,10 +13,15 @@ readonly LIVE_STATS_FILE="${DATA_DIR}/live_stats"
 readonly RATE_HISTORY_FILE="${DATA_DIR}/rate_history"
 readonly SESSION_STARTED_FILE="${DATA_DIR}/session_started"
 readonly LAST_SESSION_FILE="${DATA_DIR}/last_session"
+readonly RUN_STATE_FILE="${DATA_DIR}/run_state"
+readonly SUPERVISED_PID_FILE="${DATA_DIR}/supervised_worker.pid"
+readonly LAST_EXIT_FILE="${DATA_DIR}/last_exit"
 readonly HARD_MAX_WORKERS=32
 readonly RATE_HISTORY_LIMIT=60
 readonly RATE_HISTORY_TRIM_THRESHOLD=90
 readonly MAX_TRANSFER_TIMEOUT=1800
+readonly DEFAULT_RESTART_BASE_DELAY=2
+readonly DEFAULT_RESTART_MAX_DELAY=30
 
 WORKERS=0
 MAX_MBPS=0
@@ -28,6 +33,9 @@ CYCLE_DELAY=2
 ENDPOINTS=()
 SLOT_PIDS=()
 RATE_HISTORY_SAMPLES=0
+SUPERVISED_CHILD_PID=""
+SUPERVISOR_SLEEP_PID=""
+SUPERVISOR_STOPPING=0
 
 valid_uint() {
   case "$1" in
@@ -225,6 +233,55 @@ snapshot_session_if_needed() {
   mv -f "${LAST_SESSION_FILE}.tmp" "$LAST_SESSION_FILE"
 }
 
+save_current_session_snapshot() {
+  local started=0 now duration download upload
+  local active_download=0 active_upload=0 stats_timestamp=0
+  local previous_download=0 previous_upload=0 previous_duration=0 previous_saved=0
+  if [ -r "$SESSION_STARTED_FILE" ]; then
+    read -r started < "$SESSION_STARTED_FILE" || started=0
+  fi
+  valid_uint "$started" || started=0
+  [ "$started" -gt 0 ] || return 0
+
+  download="$(sum_counter_prefix 'download-session-worker-')"
+  upload="$(sum_counter_prefix 'upload-session-worker-')"
+  now="$(date +%s)"
+  if [ -r "$LIVE_STATS_FILE" ]; then
+    read -r _ _ active_download active_upload stats_timestamp < "$LIVE_STATS_FILE" || true
+  fi
+  valid_uint "$active_download" || active_download=0
+  valid_uint "$active_upload" || active_upload=0
+  valid_uint "$stats_timestamp" || stats_timestamp=0
+  if [ "$stats_timestamp" -eq 0 ] || [ $((now - stats_timestamp)) -gt 5 ]; then
+    active_download=0
+    active_upload=0
+  fi
+  download=$((download + active_download))
+  upload=$((upload + active_upload))
+  if [ "$now" -ge "$started" ]; then
+    duration=$((now - started))
+  else
+    duration=0
+  fi
+  if [ -r "$LAST_SESSION_FILE" ]; then
+    read -r \
+      previous_download previous_upload previous_duration previous_saved \
+      < "$LAST_SESSION_FILE" || true
+  fi
+  valid_uint "$previous_download" || previous_download=0
+  valid_uint "$previous_upload" || previous_upload=0
+  valid_uint "$previous_duration" || previous_duration=0
+  valid_uint "$previous_saved" || previous_saved=0
+  if [ "$previous_saved" -ge "$started" ]; then
+    [ "$download" -ge "$previous_download" ] || download="$previous_download"
+    [ "$upload" -ge "$previous_upload" ] || upload="$previous_upload"
+    [ "$duration" -ge "$previous_duration" ] || duration="$previous_duration"
+  fi
+  printf '%s %s %s %s\n' "$download" "$upload" "$duration" "$now" \
+    >"${LAST_SESSION_FILE}.tmp"
+  mv -f "${LAST_SESSION_FILE}.tmp" "$LAST_SESSION_FILE"
+}
+
 reset_session_stats() {
   local file now
   for file in \
@@ -242,6 +299,30 @@ reset_session_stats() {
   mv -f "${LIVE_STATS_FILE}.tmp" "$LIVE_STATS_FILE"
 }
 
+resume_session_stats() {
+  local now lines=0 started=0
+  if [ -r "$SESSION_STARTED_FILE" ]; then
+    read -r started < "$SESSION_STARTED_FILE" || started=0
+  fi
+  valid_uint "$started" || started=0
+  if [ "$started" -eq 0 ]; then
+    reset_session_stats
+    return
+  fi
+
+  if [ -r "$RATE_HISTORY_FILE" ]; then
+    lines="$(wc -l < "$RATE_HISTORY_FILE" 2>/dev/null || printf '0')"
+  fi
+  valid_uint "$lines" || lines=0
+  RATE_HISTORY_SAMPLES="$lines"
+  if [ "$RATE_HISTORY_SAMPLES" -gt "$RATE_HISTORY_TRIM_THRESHOLD" ]; then
+    trim_rate_history
+  fi
+  now="$(date +%s)"
+  printf '0 0 0 0 %s\n' "$now" >"${LIVE_STATS_FILE}.tmp"
+  mv -f "${LIVE_STATS_FILE}.tmp" "$LIVE_STATS_FILE"
+}
+
 cleanup_stale_runtime_files() {
   rm -f \
     "${DATA_DIR}"/size-*.tmp \
@@ -250,7 +331,9 @@ cleanup_stale_runtime_files() {
     "${LIVE_STATS_FILE}.tmp" \
     "${RATE_HISTORY_FILE}.tmp" \
     "${SESSION_STARTED_FILE}.tmp" \
-    "${LAST_SESSION_FILE}.tmp"
+    "${LAST_SESSION_FILE}.tmp" \
+    "${RUN_STATE_FILE}.tmp" \
+    "${LAST_EXIT_FILE}.tmp"
 }
 
 trim_rate_history() {
@@ -373,7 +456,7 @@ download_once() {
     --max-time "$TRANSFER_TIMEOUT" \
     --speed-time 30 --speed-limit 1024 \
     "${retry_args[@]}" \
-    --user-agent "sp-traffic/1.4 authorized-bandwidth-test" \
+    --user-agent "sp-traffic/1.5 authorized-bandwidth-test" \
     "${rate_arg[@]}" \
     "$url" >"$size_file" &
   curl_pid=$!
@@ -436,7 +519,6 @@ cleanup() {
   for ((slot=1; slot<=HARD_MAX_WORKERS; slot++)); do
     stop_slot "$slot"
   done
-  snapshot_session_if_needed
   now="$(date +%s)"
   printf '0 0 0 0 %s\n' "$now" >"${LIVE_STATS_FILE}.tmp"
   mv -f "${LIVE_STATS_FILE}.tmp" "$LIVE_STATS_FILE"
@@ -476,7 +558,8 @@ supervise() {
   done
 }
 
-main() {
+run_worker() {
+  local session_mode="${1:-new}"
   command -v curl >/dev/null 2>&1 || {
     echo "sp-traffic: curl is required" >&2
     exit 1
@@ -492,8 +575,15 @@ main() {
 
   mkdir -p "$COUNTER_DIR" "$PID_DIR"
   cleanup_stale_runtime_files
-  snapshot_session_if_needed
-  reset_session_stats
+  case "$session_mode" in
+    resume)
+      resume_session_stats
+      ;;
+    *)
+      snapshot_session_if_needed
+      reset_session_stats
+      ;;
+  esac
   load_config
   load_endpoints
   [ "${#ENDPOINTS[@]}" -gt 0 ] || {
@@ -506,4 +596,130 @@ main() {
   supervise
 }
 
-main "$@"
+write_run_state() {
+  local state="$1" now
+  now="$(date +%s)"
+  printf '%s %s\n' "$state" "$now" >"${RUN_STATE_FILE}.tmp"
+  mv -f "${RUN_STATE_FILE}.tmp" "$RUN_STATE_FILE"
+}
+
+terminate_worker_group() {
+  local pid="${1:-}" signal="${2:-TERM}"
+  valid_uint "$pid" || return 0
+  [ "$pid" -gt 1 ] || return 0
+  kill -s "$signal" -- "-${pid}" 2>/dev/null \
+    || kill -s "$signal" "$pid" 2>/dev/null \
+    || true
+}
+
+supervisor_stop() {
+  local child_pid=""
+  [ "$SUPERVISOR_STOPPING" -eq 0 ] || return 0
+  SUPERVISOR_STOPPING=1
+  save_current_session_snapshot || true
+  write_run_state stopped
+  if [ -n "$SUPERVISED_CHILD_PID" ]; then
+    child_pid="$SUPERVISED_CHILD_PID"
+    terminate_worker_group "$child_pid" TERM
+    wait "$SUPERVISED_CHILD_PID" 2>/dev/null || true
+    terminate_worker_group "$child_pid" KILL
+  fi
+  save_current_session_snapshot || true
+  if [ -n "$SUPERVISOR_SLEEP_PID" ]; then
+    kill "$SUPERVISOR_SLEEP_PID" 2>/dev/null || true
+    wait "$SUPERVISOR_SLEEP_PID" 2>/dev/null || true
+  fi
+  rm -f "$SUPERVISED_PID_FILE" "${SUPERVISED_PID_FILE}.tmp"
+  exit 0
+}
+
+restart_delay() {
+  local failures="$1" base="$2" maximum="$3" delay index
+  delay="$base"
+  for ((index=1; index<failures; index++)); do
+    delay=$((delay * 2))
+    if [ "$delay" -ge "$maximum" ]; then
+      delay="$maximum"
+      break
+    fi
+  done
+  [ "$delay" -le "$maximum" ] || delay="$maximum"
+  printf '%s\n' "$delay"
+}
+
+supervise_worker_process() {
+  local previous_state="" session_mode="new" status start_time end_time runtime
+  local failures=0 delay child_pid
+  local base_delay="${SP_RESTART_BASE_DELAY:-$DEFAULT_RESTART_BASE_DELAY}"
+  local maximum_delay="${SP_RESTART_MAX_DELAY:-$DEFAULT_RESTART_MAX_DELAY}"
+
+  valid_uint "$base_delay" || base_delay="$DEFAULT_RESTART_BASE_DELAY"
+  valid_uint "$maximum_delay" || maximum_delay="$DEFAULT_RESTART_MAX_DELAY"
+  [ "$base_delay" -ge 1 ] || base_delay="$DEFAULT_RESTART_BASE_DELAY"
+  [ "$maximum_delay" -ge "$base_delay" ] || maximum_delay="$base_delay"
+
+  mkdir -p "$COUNTER_DIR" "$PID_DIR"
+  if [ -r "$RUN_STATE_FILE" ]; then
+    read -r previous_state _ < "$RUN_STATE_FILE" || previous_state=""
+  fi
+  if [ "$previous_state" = "active" ] && [ -r "$SESSION_STARTED_FILE" ]; then
+    session_mode="resume"
+  else
+    rm -f "$LAST_EXIT_FILE" "${LAST_EXIT_FILE}.tmp"
+  fi
+
+  write_run_state active
+  trap supervisor_stop INT TERM HUP
+  set -m
+
+  while :; do
+    start_time="$(date +%s)"
+    "$0" --run-once "$session_mode" >/dev/null 2>&1 &
+    SUPERVISED_CHILD_PID=$!
+    printf '%s\n' "$SUPERVISED_CHILD_PID" >"${SUPERVISED_PID_FILE}.tmp"
+    mv -f "${SUPERVISED_PID_FILE}.tmp" "$SUPERVISED_PID_FILE"
+
+    child_pid="$SUPERVISED_CHILD_PID"
+    if wait "$child_pid"; then
+      status=0
+    else
+      status=$?
+    fi
+    SUPERVISED_CHILD_PID=""
+    rm -f "$SUPERVISED_PID_FILE"
+    [ "$SUPERVISOR_STOPPING" -eq 0 ] || break
+    terminate_worker_group "$child_pid" TERM
+    sleep 0.2
+    terminate_worker_group "$child_pid" KILL
+
+    end_time="$(date +%s)"
+    runtime=$((end_time - start_time))
+    if [ "$runtime" -ge 60 ]; then
+      failures=1
+    else
+      failures=$((failures + 1))
+    fi
+    delay="$(restart_delay "$failures" "$base_delay" "$maximum_delay")"
+    printf '%s %s %s %s\n' "$end_time" "$status" "$failures" "$delay" \
+      >"${LAST_EXIT_FILE}.tmp"
+    mv -f "${LAST_EXIT_FILE}.tmp" "$LAST_EXIT_FILE"
+    write_run_state active
+    session_mode="resume"
+
+    sleep "$delay" &
+    SUPERVISOR_SLEEP_PID=$!
+    wait "$SUPERVISOR_SLEEP_PID" 2>/dev/null || true
+    SUPERVISOR_SLEEP_PID=""
+    [ "$SUPERVISOR_STOPPING" -eq 0 ] || break
+  done
+}
+
+case "${1:-}" in
+  --run-once)
+    shift
+    run_worker "${1:-new}"
+    ;;
+  *)
+    supervise_worker_process
+    ;;
+esac
