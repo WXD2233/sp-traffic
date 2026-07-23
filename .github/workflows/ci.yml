@@ -11,7 +11,7 @@ jobs:
   shell-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Validate shell scripts
         run: bash tests/test.sh
       - name: Run worker integration test
