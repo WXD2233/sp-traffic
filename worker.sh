@@ -13,6 +13,9 @@ readonly LIVE_STATS_FILE="${DATA_DIR}/live_stats"
 readonly RATE_HISTORY_FILE="${DATA_DIR}/rate_history"
 readonly SESSION_STARTED_FILE="${DATA_DIR}/session_started"
 readonly HARD_MAX_WORKERS=32
+readonly RATE_HISTORY_LIMIT=60
+readonly RATE_HISTORY_TRIM_THRESHOLD=90
+readonly MAX_TRANSFER_TIMEOUT=1800
 
 WORKERS=0
 MAX_MBPS=0
@@ -23,6 +26,7 @@ TRANSFER_TIMEOUT=900
 CYCLE_DELAY=2
 ENDPOINTS=()
 SLOT_PIDS=()
+RATE_HISTORY_SAMPLES=0
 
 valid_uint() {
   case "$1" in
@@ -65,6 +69,8 @@ load_config() {
   [ "$WORKERS" -le "$HARD_MAX_WORKERS" ] || WORKERS="$HARD_MAX_WORKERS"
   [ "$CONNECT_TIMEOUT" -ge 1 ] || CONNECT_TIMEOUT=15
   [ "$TRANSFER_TIMEOUT" -ge 30 ] || TRANSFER_TIMEOUT=30
+  [ "$TRANSFER_TIMEOUT" -le "$MAX_TRANSFER_TIMEOUT" ] ||
+    TRANSFER_TIMEOUT="$MAX_TRANSFER_TIMEOUT"
   [ "$CYCLE_DELAY" -ge 2 ] || CYCLE_DELAY=2
 }
 
@@ -193,8 +199,26 @@ reset_session_stats() {
   printf '%s\n' "$now" >"${SESSION_STARTED_FILE}.tmp"
   mv -f "${SESSION_STARTED_FILE}.tmp" "$SESSION_STARTED_FILE"
   : > "$RATE_HISTORY_FILE"
+  RATE_HISTORY_SAMPLES=0
   printf '0 0 0 0 %s\n' "$now" >"${LIVE_STATS_FILE}.tmp"
   mv -f "${LIVE_STATS_FILE}.tmp" "$LIVE_STATS_FILE"
+}
+
+cleanup_stale_runtime_files() {
+  rm -f \
+    "${DATA_DIR}"/size-*.tmp \
+    "${DATA_DIR}"/progress-*.tmp \
+    "${PID_DIR}"/curl-*.pid \
+    "${LIVE_STATS_FILE}.tmp" \
+    "${RATE_HISTORY_FILE}.tmp" \
+    "${SESSION_STARTED_FILE}.tmp"
+}
+
+trim_rate_history() {
+  [ -f "$RATE_HISTORY_FILE" ] || return 0
+  tail -n "$RATE_HISTORY_LIMIT" "$RATE_HISTORY_FILE" >"${RATE_HISTORY_FILE}.tmp"
+  mv -f "${RATE_HISTORY_FILE}.tmp" "$RATE_HISTORY_FILE"
+  RATE_HISTORY_SAMPLES="$RATE_HISTORY_LIMIT"
 }
 
 update_live_stats() {
@@ -264,10 +288,9 @@ update_live_stats() {
     >"${LIVE_STATS_FILE}.tmp"
   mv -f "${LIVE_STATS_FILE}.tmp" "$LIVE_STATS_FILE"
   printf '%s %s %s\n' "$download_rate" "$upload_rate" "$now" >> "$RATE_HISTORY_FILE"
-
-  if [ $((now % 60)) -eq 0 ]; then
-    tail -n 60 "$RATE_HISTORY_FILE" >"${RATE_HISTORY_FILE}.tmp"
-    mv -f "${RATE_HISTORY_FILE}.tmp" "$RATE_HISTORY_FILE"
+  RATE_HISTORY_SAMPLES=$((RATE_HISTORY_SAMPLES + 1))
+  if [ "$RATE_HISTORY_SAMPLES" -gt "$RATE_HISTORY_TRIM_THRESHOLD" ]; then
+    trim_rate_history
   fi
 }
 
@@ -428,6 +451,7 @@ main() {
   }
 
   mkdir -p "$COUNTER_DIR" "$PID_DIR"
+  cleanup_stale_runtime_files
   reset_session_stats
   load_config
   load_endpoints

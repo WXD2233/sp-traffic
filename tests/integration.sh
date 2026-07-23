@@ -34,6 +34,9 @@ TRANSFER_TIMEOUT=30
 CYCLE_DELAY=2
 EOF
 printf 'http://127.0.0.1:%s/test.bin\n' "$TEST_PORT" >"$TEST_DIR/config/endpoints"
+printf 'stale\n' >"$TEST_DIR/data/progress-99.tmp"
+printf 'stale\n' >"$TEST_DIR/data/size-99.tmp"
+printf '999999\n' >"$TEST_DIR/data/pids/curl-99.pid"
 
 if [[ "$PYTHON_BIN" == *.exe ]] && command -v cygpath >/dev/null 2>&1; then
   SERVER_DIRECTORY="$(cygpath -w "$SERVER_DIRECTORY")"
@@ -62,12 +65,25 @@ SP_DATA_DIR="$TEST_DIR/data" \
 WORKER_PID=$!
 
 sleep 7
+[ ! -e "$TEST_DIR/data/progress-99.tmp" ]
+[ ! -e "$TEST_DIR/data/size-99.tmp" ]
+[ ! -e "$TEST_DIR/data/pids/curl-99.pid" ]
 [ -s "$TEST_DIR/data/live_stats" ] || {
   echo "expected live_stats to be created" >&2
   exit 1
 }
 [ "$(awk '{print NF}' "$TEST_DIR/data/live_stats")" -eq 5 ] || {
   echo "expected live_stats to contain five fields" >&2
+  exit 1
+}
+history_lines="$(wc -l < "$TEST_DIR/data/rate_history")"
+[ "$history_lines" -le 90 ] || {
+  echo "expected bounded rate history, got $history_lines lines" >&2
+  exit 1
+}
+runtime_kb="$(du -sk "$TEST_DIR/data" | awk '{print $1}')"
+[ "$runtime_kb" -lt 1024 ] || {
+  echo "expected runtime data to remain below 1 MiB in the single-worker test, got ${runtime_kb} KiB" >&2
   exit 1
 }
 kill "$WORKER_PID" 2>/dev/null || true
