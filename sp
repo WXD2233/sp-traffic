@@ -129,7 +129,7 @@ EOF
 }
 
 ensure_endpoint() {
-  [ "$(endpoint_count)" -gt 0 ] || die "请先用“端点管理”添加你拥有或获授权的下载 URL"
+  [ "$(endpoint_count)" -gt 0 ] || die "请先用 '端点管理' 添加你拥有或获授权的下载 URL"
 }
 
 start_command() {
@@ -256,7 +256,6 @@ configure_limits() {
 }
 
 endpoint_menu() {
-  require_root "$@"
   while :; do
     cat <<'EOF'
 

@@ -134,8 +134,10 @@ wait_while_paused() {
 }
 
 download_once() {
-  local slot="$1" url="$2" size_file="${DATA_DIR}/size-${slot}.tmp"
-  local pid_file="${PID_DIR}/curl-${slot}.pid" rate_arg=() per_worker_kbps=0
+  local slot="$1" url="$2"
+  local size_file="${DATA_DIR}/size-${slot}.tmp"
+  local pid_file="${PID_DIR}/curl-${slot}.pid" per_worker_kbps=0
+  local -a rate_arg=()
   local active_workers=1 curl_pid status bytes
 
   if [ "$MAX_MBPS" -gt 0 ]; then
@@ -195,12 +197,13 @@ run_slot() {
 }
 
 stop_slot() {
-  local slot="$1" pid="${SLOT_PIDS[$slot]:-}"
+  local slot="$1" pid
+  pid="${SLOT_PIDS[slot]:-}"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   fi
-  SLOT_PIDS[$slot]=""
+  SLOT_PIDS[slot]=""
   if [ -f "${PID_DIR}/curl-${slot}.pid" ]; then
     kill "$(cat "${PID_DIR}/curl-${slot}.pid")" 2>/dev/null || true
     rm -f "${PID_DIR}/curl-${slot}.pid"
@@ -223,11 +226,11 @@ supervise() {
     printf '%s\n' "$target" > "$EFFECTIVE_WORKERS_FILE"
 
     for ((slot=1; slot<=HARD_MAX_WORKERS; slot++)); do
-      pid="${SLOT_PIDS[$slot]:-}"
+      pid="${SLOT_PIDS[slot]:-}"
       if [ "$slot" -le "$target" ]; then
         if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
           run_slot "$slot" &
-          SLOT_PIDS[$slot]=$!
+          SLOT_PIDS[slot]=$!
         fi
       elif [ -n "$pid" ]; then
         stop_slot "$slot"
