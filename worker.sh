@@ -12,6 +12,7 @@ readonly EFFECTIVE_WORKERS_FILE="${DATA_DIR}/effective_workers"
 readonly LIVE_STATS_FILE="${DATA_DIR}/live_stats"
 readonly RATE_HISTORY_FILE="${DATA_DIR}/rate_history"
 readonly SESSION_STARTED_FILE="${DATA_DIR}/session_started"
+readonly LAST_SESSION_FILE="${DATA_DIR}/last_session"
 readonly HARD_MAX_WORKERS=32
 readonly RATE_HISTORY_LIMIT=60
 readonly RATE_HISTORY_TRIM_THRESHOLD=90
@@ -181,10 +182,47 @@ add_counter() {
 
 record_transfer() {
   local slot="$1" download_bytes="$2" upload_bytes="$3"
-  add_counter "${COUNTER_DIR}/download-total-worker-${slot}" "$download_bytes"
   add_counter "${COUNTER_DIR}/download-session-worker-${slot}" "$download_bytes"
-  add_counter "${COUNTER_DIR}/upload-total-worker-${slot}" "$upload_bytes"
   add_counter "${COUNTER_DIR}/upload-session-worker-${slot}" "$upload_bytes"
+}
+
+sum_counter_prefix() {
+  local prefix="$1" total=0 file value
+  for file in "${COUNTER_DIR}/${prefix}"*; do
+    [ -f "$file" ] || continue
+    value="$(read_counter "$file")"
+    total=$((total + value))
+  done
+  printf '%s\n' "$total"
+}
+
+snapshot_session_if_needed() {
+  local started=0 last_saved=0 previous_download previous_upload
+  local now duration
+  if [ -r "$SESSION_STARTED_FILE" ]; then
+    read -r started < "$SESSION_STARTED_FILE" || started=0
+  fi
+  valid_uint "$started" || started=0
+  [ "$started" -gt 0 ] || return 0
+
+  if [ -r "$LAST_SESSION_FILE" ]; then
+    read -r _ _ _ last_saved < "$LAST_SESSION_FILE" || true
+  fi
+  valid_uint "$last_saved" || last_saved=0
+  [ "$last_saved" -lt "$started" ] || return 0
+
+  previous_download="$(sum_counter_prefix 'download-session-worker-')"
+  previous_upload="$(sum_counter_prefix 'upload-session-worker-')"
+  now="$(date +%s)"
+  if [ "$now" -ge "$started" ]; then
+    duration=$((now - started))
+  else
+    duration=0
+  fi
+  printf '%s %s %s %s\n' \
+    "$previous_download" "$previous_upload" "$duration" "$now" \
+    >"${LAST_SESSION_FILE}.tmp"
+  mv -f "${LAST_SESSION_FILE}.tmp" "$LAST_SESSION_FILE"
 }
 
 reset_session_stats() {
@@ -211,7 +249,8 @@ cleanup_stale_runtime_files() {
     "${PID_DIR}"/curl-*.pid \
     "${LIVE_STATS_FILE}.tmp" \
     "${RATE_HISTORY_FILE}.tmp" \
-    "${SESSION_STARTED_FILE}.tmp"
+    "${SESSION_STARTED_FILE}.tmp" \
+    "${LAST_SESSION_FILE}.tmp"
 }
 
 trim_rate_history() {
@@ -397,6 +436,7 @@ cleanup() {
   for ((slot=1; slot<=HARD_MAX_WORKERS; slot++)); do
     stop_slot "$slot"
   done
+  snapshot_session_if_needed
   now="$(date +%s)"
   printf '0 0 0 0 %s\n' "$now" >"${LIVE_STATS_FILE}.tmp"
   mv -f "${LIVE_STATS_FILE}.tmp" "$LIVE_STATS_FILE"
@@ -452,6 +492,7 @@ main() {
 
   mkdir -p "$COUNTER_DIR" "$PID_DIR"
   cleanup_stale_runtime_files
+  snapshot_session_if_needed
   reset_session_stats
   load_config
   load_endpoints

@@ -12,6 +12,7 @@ readonly PAUSE_REASON_FILE="${DATA_DIR}/pause_reason"
 readonly LIVE_STATS_FILE="${DATA_DIR}/live_stats"
 readonly RATE_HISTORY_FILE="${DATA_DIR}/rate_history"
 readonly SESSION_STARTED_FILE="${DATA_DIR}/session_started"
+readonly LAST_SESSION_FILE="${DATA_DIR}/last_session"
 readonly HARD_MAX_WORKERS=32
 readonly DEFAULT_ENDPOINT="${SP_DEFAULT_ENDPOINT:-https://sin-speed.hetzner.com/10GB.bin}"
 
@@ -49,6 +50,7 @@ service_start() {
 }
 
 service_stop() {
+  save_current_as_last
   case "$(backend)" in
     systemd) systemctl stop sp-traffic.service ;;
     openrc) rc-service sp-traffic stop ;;
@@ -57,6 +59,7 @@ service_stop() {
 }
 
 service_restart() {
+  save_current_as_last
   case "$(backend)" in
     systemd) systemctl restart sp-traffic.service ;;
     openrc) rc-service sp-traffic restart ;;
@@ -140,19 +143,8 @@ sum_counter_prefix() {
   printf '%s\n' "$total"
 }
 
-total_downloaded() {
-  local legacy current
-  legacy="$(sum_counter_prefix 'worker-')"
-  current="$(sum_counter_prefix 'download-total-worker-')"
-  printf '%s\n' "$((legacy + current))"
-}
-
 session_downloaded() {
   sum_counter_prefix 'download-session-worker-'
-}
-
-total_uploaded() {
-  sum_counter_prefix 'upload-total-worker-'
 }
 
 session_uploaded() {
@@ -206,6 +198,32 @@ format_rate() {
   awk -v value="$bytes_per_second" 'BEGIN {printf "%.1f Mbps", value * 8 / 1000000}'
 }
 
+read_last_session() {
+  local download=0 upload=0 duration=0 saved_at=0
+  if [ -r "$LAST_SESSION_FILE" ]; then
+    read -r download upload duration saved_at < "$LAST_SESSION_FILE" || true
+  fi
+  valid_uint "$download" || download=0
+  valid_uint "$upload" || upload=0
+  valid_uint "$duration" || duration=0
+  valid_uint "$saved_at" || saved_at=0
+  printf '%s %s %s %s\n' "$download" "$upload" "$duration" "$saved_at"
+}
+
+save_current_as_last() {
+  local active_download active_upload
+  local download upload duration now
+  service_is_active || return 0
+  read -r _ _ active_download active_upload _ <<<"$(read_live_stats)"
+  download=$(( $(session_downloaded) + active_download ))
+  upload=$(( $(session_uploaded) + active_upload ))
+  duration="$(session_duration)"
+  now="$(date +%s)"
+  printf '%s %s %s %s\n' "$download" "$upload" "$duration" "$now" \
+    >"${LAST_SESSION_FILE}.tmp"
+  mv -f "${LAST_SESSION_FILE}.tmp" "$LAST_SESSION_FILE"
+}
+
 service_state_text() {
   local pause_reason=""
   if service_is_active; then
@@ -227,13 +245,15 @@ service_state_text() {
 show_status() {
   local state workers=0 qdisc cc available_mb minimum_mb aggressive_mode
   local download_rate upload_rate active_download active_upload
-  local session_down session_up total_down total_up duration
+  local session_down session_up duration last_down last_up last_duration
+  local is_active=0
   state="$(service_state_text)"
+  service_is_active && is_active=1
   [ -r "${DATA_DIR}/effective_workers" ] && read -r workers < "${DATA_DIR}/effective_workers"
   qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
   read -r download_rate upload_rate active_download active_upload _ <<<"$(read_live_stats)"
-  if ! service_is_active; then
+  if [ "$is_active" -eq 0 ]; then
     download_rate=0
     upload_rate=0
     active_download=0
@@ -241,9 +261,13 @@ show_status() {
   fi
   session_down=$(( $(session_downloaded) + active_download ))
   session_up=$(( $(session_uploaded) + active_upload ))
-  total_down=$(( $(total_downloaded) + active_download ))
-  total_up=$(( $(total_uploaded) + active_upload ))
   duration="$(session_duration)"
+  if [ "$is_active" -eq 0 ]; then
+    session_down=0
+    session_up=0
+    duration=0
+  fi
+  read -r last_down last_up last_duration _ <<<"$(read_last_session)"
   available_mb="$(available_disk_mb 2>/dev/null || printf '未知')"
   minimum_mb="$(config_uint MIN_FREE_DISK_MB 200)"
   aggressive_mode="$(config_uint AGGRESSIVE_MODE 1)"
@@ -261,8 +285,9 @@ SP Traffic 状态
   实时上传:   $(format_rate "$upload_rate")
   本次下载:   $(human_bytes "$session_down")
   本次上传:   $(human_bytes "$session_up")
-  总计下载:   $(human_bytes "$total_down")
-  总计上传:   $(human_bytes "$total_up")
+  上次下载:   $(human_bytes "$last_down")
+  上次上传:   $(human_bytes "$last_up")
+  上次时长:   $(format_duration "$last_duration")
   运行时长:   $(format_duration "$duration")
   可用磁盘:   ${available_mb} MiB
   暂停阈值:   ${minimum_mb} MiB
@@ -335,6 +360,7 @@ clear_command() {
   now="$(date +%s)"
   printf '%s\n' "$now" >"$SESSION_STARTED_FILE"
   : > "$RATE_HISTORY_FILE"
+  rm -f "$LAST_SESSION_FILE" "${LAST_SESSION_FILE}.tmp"
   rm -f "${DATA_DIR}"/size-*.tmp "${DATA_DIR}"/progress-*.tmp
   if [ "$was_active" -eq 1 ]; then
     if [ "$was_paused" -eq 1 ]; then
@@ -570,7 +596,9 @@ dashboard_line() {
 }
 
 load_dashboard_stats() {
+  local is_active=0
   DASHBOARD_STATE="$(service_state_text)"
+  service_is_active && is_active=1
   DASHBOARD_WORKERS=0
   [ -r "${DATA_DIR}/effective_workers" ] &&
     read -r DASHBOARD_WORKERS < "${DATA_DIR}/effective_workers"
@@ -582,7 +610,7 @@ load_dashboard_stats() {
     DASHBOARD_ACTIVE_DOWNLOAD \
     DASHBOARD_ACTIVE_UPLOAD \
     _ <<<"$(read_live_stats)"
-  if ! service_is_active; then
+  if [ "$is_active" -eq 0 ]; then
     DASHBOARD_DOWNLOAD_RATE=0
     DASHBOARD_UPLOAD_RATE=0
     DASHBOARD_ACTIVE_DOWNLOAD=0
@@ -591,9 +619,17 @@ load_dashboard_stats() {
 
   DASHBOARD_SESSION_DOWNLOAD=$(( $(session_downloaded) + DASHBOARD_ACTIVE_DOWNLOAD ))
   DASHBOARD_SESSION_UPLOAD=$(( $(session_uploaded) + DASHBOARD_ACTIVE_UPLOAD ))
-  DASHBOARD_TOTAL_DOWNLOAD=$(( $(total_downloaded) + DASHBOARD_ACTIVE_DOWNLOAD ))
-  DASHBOARD_TOTAL_UPLOAD=$(( $(total_uploaded) + DASHBOARD_ACTIVE_UPLOAD ))
   DASHBOARD_DURATION="$(session_duration)"
+  if [ "$is_active" -eq 0 ]; then
+    DASHBOARD_SESSION_DOWNLOAD=0
+    DASHBOARD_SESSION_UPLOAD=0
+    DASHBOARD_DURATION=0
+  fi
+  read -r \
+    DASHBOARD_LAST_DOWNLOAD \
+    DASHBOARD_LAST_UPLOAD \
+    DASHBOARD_LAST_DURATION \
+    _ <<<"$(read_last_session)"
   DASHBOARD_DISK="$(available_disk_mb 2>/dev/null || printf '未知')"
   DASHBOARD_MODE="$(config_uint AGGRESSIVE_MODE 1)"
   if [ "$DASHBOARD_MODE" -eq 1 ]; then
@@ -660,12 +696,13 @@ render_dashboard_wide() {
     "$(human_bytes "$DASHBOARD_SESSION_DOWNLOAD")" \
     "$(human_bytes "$DASHBOARD_SESSION_UPLOAD")"
   dashboard_line 5 "$right_column" "$line"
-  printf -v line '│ 历史总计   下载 %-11s   上传 %-11s' \
-    "$(human_bytes "$DASHBOARD_TOTAL_DOWNLOAD")" \
-    "$(human_bytes "$DASHBOARD_TOTAL_UPLOAD")"
+  printf -v line '│ 上次记录   下载 %-11s   上传 %-11s' \
+    "$(human_bytes "$DASHBOARD_LAST_DOWNLOAD")" \
+    "$(human_bytes "$DASHBOARD_LAST_UPLOAD")"
   dashboard_line 6 "$right_column" "$line"
-  printf -v line '│ 运行时长 %-10s   连接数 %s / %s' \
+  printf -v line '│ 本次时长 %-10s   上次时长 %-10s   连接数 %s / %s' \
     "$(format_duration "$DASHBOARD_DURATION")" \
+    "$(format_duration "$DASHBOARD_LAST_DURATION")" \
     "$DASHBOARD_WORKERS" "$HARD_MAX_WORKERS"
   dashboard_line 7 "$right_column" "$line"
   printf -v line '│ 磁盘剩余 %-10s MiB   状态 %s%s%s' \
@@ -709,10 +746,11 @@ EOF
   printf '本次: 下载 %s  上传 %s\n' \
     "$(human_bytes "$DASHBOARD_SESSION_DOWNLOAD")" \
     "$(human_bytes "$DASHBOARD_SESSION_UPLOAD")"
-  printf '总计: 下载 %s  上传 %s\n' \
-    "$(human_bytes "$DASHBOARD_TOTAL_DOWNLOAD")" \
-    "$(human_bytes "$DASHBOARD_TOTAL_UPLOAD")"
-  printf '状态: %s  时长: %s  并发: %s/%s\n' \
+  printf '上次: 下载 %s  上传 %s  时长 %s\n' \
+    "$(human_bytes "$DASHBOARD_LAST_DOWNLOAD")" \
+    "$(human_bytes "$DASHBOARD_LAST_UPLOAD")" \
+    "$(format_duration "$DASHBOARD_LAST_DURATION")"
+  printf '状态: %s  本次时长: %s  并发: %s/%s\n' \
     "$DASHBOARD_STATE" "$(format_duration "$DASHBOARD_DURATION")" \
     "$DASHBOARD_WORKERS" "$HARD_MAX_WORKERS"
   printf '请选择: '
@@ -798,8 +836,8 @@ main_menu() {
   while :; do
     render_dashboard
     choice=""
-    if ! IFS= read -rsn1 -t 1 choice; then
-      continue
+    if ! IFS= read -rsn1 choice; then
+      return
     fi
     run_menu_action "$choice"
     action_status=$?
@@ -843,7 +881,7 @@ case "${1:-menu}" in
     cat <<'EOF'
 用法: sp [dashboard|status|start|pause|resume|stop|clear|endpoints|configure|logs|uninstall]
 端点: sp endpoints {list|default|add URL|remove URL}
-不带参数时打开每秒刷新的交互看板；菜单使用单键选择。
+不带参数时打开交互看板；菜单使用单键选择，按 R 手动刷新。
 EOF
     ;;
   *) die "未知命令: $1（使用 sp --help 查看帮助）" ;;

@@ -37,7 +37,16 @@ grep -Fq 'cleanup_stale_runtime_files' "${ROOT_DIR}/worker.sh"
 grep -Fq 'ensure_disk_headroom' "${ROOT_DIR}/sp"
 grep -Fq '2) 开始/继续' "${ROOT_DIR}/sp"
 grep -Fq '本次运行' "${ROOT_DIR}/sp"
-grep -Fq '历史总计' "${ROOT_DIR}/sp"
+grep -Fq '上次记录' "${ROOT_DIR}/sp"
+grep -Fq 'save_current_as_last' "${ROOT_DIR}/sp"
+if grep -Fq '历史总计' "${ROOT_DIR}/sp"; then
+  echo "历史总计 should no longer appear in the dashboard" >&2
+  exit 1
+fi
+if grep -Fq 'read -rsn1 -t' "${ROOT_DIR}/sp"; then
+  echo "interactive dashboard should not redraw on a read timeout" >&2
+  exit 1
+fi
 
 workers_error="$(bash "${ROOT_DIR}/install.sh" --workers 33 2>&1 || true)"
 grep -q -- '--workers 最大为 32' <<<"$workers_error"

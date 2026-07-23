@@ -90,19 +90,20 @@ kill "$WORKER_PID" 2>/dev/null || true
 wait "$WORKER_PID" 2>/dev/null || true
 WORKER_PID=""
 
-total="$(awk '{sum += $1} END {print sum + 0}' "$TEST_DIR"/data/counters/download-total-worker-*)"
-[ "$total" -ge 262144 ] || {
-  echo "expected at least one completed 256 KiB download, got $total bytes" >&2
-  exit 1
-}
 session_total="$(awk '{sum += $1} END {print sum + 0}' "$TEST_DIR"/data/counters/download-session-worker-*)"
 [ "$session_total" -ge 262144 ] || {
   echo "expected session download statistics, got $session_total bytes" >&2
   exit 1
 }
-upload_total="$(awk '{sum += $1} END {print sum + 0}' "$TEST_DIR"/data/counters/upload-total-worker-*)"
+total="$session_total"
+upload_total="$(awk '{sum += $1} END {print sum + 0}' "$TEST_DIR"/data/counters/upload-session-worker-*)"
 [ "$upload_total" -ge 0 ] || {
   echo "expected upload statistics to be numeric" >&2
+  exit 1
+}
+read -r last_download _ _ _ <"$TEST_DIR/data/last_session"
+[ "$last_download" -ge "$session_total" ] || {
+  echo "expected worker shutdown to preserve the last session" >&2
   exit 1
 }
 
@@ -127,10 +128,9 @@ session_after_restart="$(awk '{sum += $1} END {print sum + 0}' \
   echo "expected a restarted worker to reset session statistics" >&2
   exit 1
 }
-historical_after_restart="$(awk '{sum += $1} END {print sum + 0}' \
-  "$TEST_DIR"/data/counters/download-total-worker-*)"
-[ "$historical_after_restart" -eq "$total" ] || {
-  echo "expected historical total to survive restart" >&2
+read -r previous_download _ _ _ <"$TEST_DIR/data/last_session"
+[ "$previous_download" -eq "$last_download" ] || {
+  echo "expected the last-session record to survive restart" >&2
   exit 1
 }
 kill "$WORKER_PID" 2>/dev/null || true
@@ -147,7 +147,9 @@ id() {
 }
 systemctl() {
   case "${1:-}" in
-    is-active) return 3 ;;
+    is-active)
+      [ "${MOCK_ACTIVE:-0}" = "1" ]
+      ;;
     *) return 0 ;;
   esac
 }
@@ -158,11 +160,32 @@ tput() {
   printf '130\n'
 }
 export -f id systemctl sysctl tput
+export MOCK_ACTIVE=1
+mock_now="$(date +%s)"
+printf '12345\n' >"$TEST_DIR/data/counters/download-session-worker-1"
+printf '678\n' >"$TEST_DIR/data/counters/upload-session-worker-1"
+printf '%s\n' "$((mock_now - 20))" >"$TEST_DIR/data/session_started"
+printf '0 0 55 22 %s\n' "$mock_now" >"$TEST_DIR/data/live_stats"
+SP_CONFIG_DIR="$TEST_DIR/config" \
+SP_DATA_DIR="$TEST_DIR/data" \
+  "$ROOT_DIR/sp" stop >"$TEST_DIR/stop.txt"
+read -r stopped_download stopped_upload stopped_duration _ <"$TEST_DIR/data/last_session"
+[ "$stopped_download" -eq 12400 ]
+[ "$stopped_upload" -eq 700 ]
+[ "$stopped_duration" -ge 20 ]
+
+export MOCK_ACTIVE=0
 SP_CONFIG_DIR="$TEST_DIR/config" \
 SP_DATA_DIR="$TEST_DIR/data" \
   "$ROOT_DIR/sp" dashboard >"$TEST_DIR/dashboard.txt"
 grep -q '开始/继续' "$TEST_DIR/dashboard.txt"
 grep -q '本次运行' "$TEST_DIR/dashboard.txt"
-grep -q '历史总计' "$TEST_DIR/dashboard.txt"
+grep -q '上次记录' "$TEST_DIR/dashboard.txt"
+grep -Eq '本次运行.*下载[[:space:]]+0\.00 B.*上传[[:space:]]+0\.00 B' \
+  "$TEST_DIR/dashboard.txt"
+if grep -q '历史总计' "$TEST_DIR/dashboard.txt"; then
+  echo "dashboard should show the last session instead of historical totals" >&2
+  exit 1
+fi
 
-printf 'Worker integration passed (%s bytes); session/history and low-disk guard passed.\n' "$total"
+printf 'Worker integration passed (%s bytes); last-session and low-disk guard passed.\n' "$total"
